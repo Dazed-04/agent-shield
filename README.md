@@ -105,26 +105,26 @@ agent-shield/
 ├── backend/
 │   ├── app/
 │   │   ├── agent/
-│   │   │   ├── langgraph_agent.py   # LangGraph ReAct StateGraph & interceptor
-│   │   │   ├── orchestrator.py      # Resilient key rotation & fallback provider
-│   │   │   └── tools.py             # Sandboxed filesystem & code execution tools
+│   │   │   ├── langgraph_agent.py      # LangGraph ReAct StateGraph & interceptor
+│   │   │   ├── orchestrator.py         # Resilient key rotation & fallback provider
+│   │   │   └── tools.py                # Sandboxed filesystem & code execution tools
 │   │   ├── detectors/
-│   │   │   ├── jailbreak_detector.py# MiniLM embedding similarity scanner
-│   │   │   ├── prompt_scanner.py    # Injection & credential exfiltration heuristics
-│   │   │   ├── response_scanner.py  # PII & API key redaction engine
-│   │   │   └── tool_monitor.py      # Tool ACL & session lease manager
+│   │   │   ├── jailbreak_detector.py   # MiniLM embedding similarity scanner
+│   │   │   ├── prompt_scanner.py       # Injection & credential exfiltration heuristics
+│   │   │   ├── response_scanner.py     # PII & API key redaction engine
+│   │   │   └── tool_monitor.py         # Tool ACL & session lease manager
 │   │   ├── engine/
-│   │   │   └── risk_engine.py       # Peak-threat scoring & policy evaluator
-│   │   ├── config.py                # Policy thresholds & global settings
-│   │   ├── database.py              # SQLAlchemy engine & session factory
-│   │   ├── models.py                # Database audit schema
-│   │   ├── schemas.py               # Pydantic validation contracts
-│   │   └── main.py                  # FastAPI gateway router & HITL endpoints
+│   │   │   └── risk_engine.py          # Peak-threat scoring & policy evaluator
+│   │   ├── config.py                   # Policy thresholds & global settings
+│   │   ├── database.py                 # SQLAlchemy engine & session factory
+│   │   ├── models.py                   # Database audit schema
+│   │   ├── schemas.py                  # Pydantic validation contracts
+│   │   └── main.py                     # FastAPI gateway router & HITL endpoints
 │   ├── requirements.txt
 │   └── .env.example
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx                  # Interface with chat, HITL modal & telemetry
+│   │   ├── App.jsx                     # Interface with chat, HITL modal & telemetry
 │   │   ├── main.jsx
 │   │   └── index.css
 │   ├── package.json

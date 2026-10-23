@@ -314,6 +314,71 @@ export default function App() {
       }
     });
 
+    // REAL-TIME SESSION SYNC (Catches CLI and curl chats instantly)
+    eventSource.addEventListener("chat_message", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        setSessions((prevSessions) => {
+          // Check if session exists in sidebar list, otherwise create it
+          const exists = prevSessions.some((s) => s.id === data.session_id);
+          const title = data.session_id.startsWith("cli_")
+            ? `CLI: ${data.prompt.slice(0, 20)}...`
+            : `${data.prompt.slice(0, 24)}...`;
+
+          let updated = [...prevSessions];
+          if (!exists) {
+            updated = [
+              { id: data.session_id, title: title, messages: [] },
+              ...updated,
+            ];
+          }
+
+          return updated.map((s) => {
+            if (s.id === data.session_id) {
+              // Avoid duplicate messages if already present
+              const hasLog = s.messages.some((m) => m.logId === data.log_id);
+              if (hasLog) return s;
+
+              const userMsg = {
+                role: "user",
+                content: data.prompt,
+                attachmentData: data.attachment || null,
+                timestamp: new Date().toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+              };
+
+              const botMsg = {
+                role: "agent",
+                content: data.reply,
+                decision: data.decision,
+                risk: data.risk_score,
+                justification: data.justification,
+                logId: data.log_id,
+                toolCalls: data.tool_calls || [],
+                approvalNeeded: data.approval_needed,
+                timestamp: new Date().toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+              };
+
+              return {
+                ...s,
+                messages: [...s.messages, userMsg, botMsg],
+                title: s.title === "New Session" ? title : s.title,
+              };
+            }
+            return s;
+          });
+        });
+      } catch (err) {
+        console.error("Failed to parse chat_message event:", err);
+      }
+    });
+
     eventSource.onerror = () => {
       // EventSource auto-reconnects natively if the server reboots
       setLastSyncTime("Reconnecting...");
@@ -529,8 +594,15 @@ export default function App() {
     try {
       const res = await axios.post(
         `${API_BASE}/chat`,
-        { prompt: finalPrompt, thread_id: currentSessionId },
-        { signal: abortControllerRef.current.signal },
+        {
+          prompt: finalPrompt,
+          thread_id: currentSessionId,
+          role: "Standard Users",
+        },
+        {
+          signal: abortControllerRef.current.signal,
+          headers: { "X-Client-Interface": "web" },
+        },
       );
 
       const latencyMs = Math.round(performance.now() - startTime);
@@ -1191,33 +1263,66 @@ export default function App() {
                             </div>
                           </div>
 
-                          <div className="rounded-xl bg-[#0c101c] border border-slate-800/80 p-3.5 max-h-[460px] overflow-y-auto overflow-x-auto leading-relaxed">
+                          <div className="rounded-xl bg-[#0c101c] border border-slate-800/80 p-4 max-h-[460px] overflow-y-auto overflow-x-auto leading-relaxed">
                             <ReactMarkdown
                               remarkPlugins={[remarkGfm]}
                               components={{
+                                // Paragraph spacing so stacked lines never overlap
+                                p: ({ node, ...props }) => (
+                                  <p
+                                    className="my-1.5 leading-relaxed text-slate-200"
+                                    {...props}
+                                  />
+                                ),
+                                // Clean, subtle lists
+                                ul: ({ node, ...props }) => (
+                                  <ul
+                                    className="list-disc list-outside pl-5 my-2 space-y-1 text-slate-300"
+                                    {...props}
+                                  />
+                                ),
+                                ol: ({ node, ...props }) => (
+                                  <ol
+                                    className="list-decimal list-outside pl-5 my-2 space-y-1 text-slate-300"
+                                    {...props}
+                                  />
+                                ),
+                                blockquote: ({ node, ...props }) => (
+                                  <blockquote
+                                    className="border-l-2 border-sky-500/40 pl-3 my-2 text-slate-400 italic bg-sky-950/10 py-1 rounded-r"
+                                    {...props}
+                                  />
+                                ),
+                                strong: ({ node, ...props }) => (
+                                  <strong
+                                    className="font-semibold text-slate-100"
+                                    {...props}
+                                  />
+                                ),
+                                // Elegant table styling without heavy borders
                                 table: ({ node, ...props }) => (
-                                  <div className="overflow-x-auto my-2">
+                                  <div className="overflow-x-auto my-2.5 rounded-lg border border-slate-800 bg-slate-950/40">
                                     <table
-                                      className="border-collapse border border-slate-700 text-xs w-full text-left"
+                                      className="border-collapse text-xs w-full text-left"
                                       {...props}
                                     />
                                   </div>
                                 ),
                                 th: ({ node, ...props }) => (
                                   <th
-                                    className="border border-slate-700 bg-slate-800 px-3 py-1.5 font-semibold text-slate-200"
+                                    className="border-b border-slate-800 bg-slate-900/90 px-3.5 py-2 font-semibold text-slate-200"
                                     {...props}
                                   />
                                 ),
                                 td: ({ node, ...props }) => (
                                   <td
-                                    className="border border-slate-700 px-3 py-1.5 text-slate-300"
+                                    className="border-b border-slate-800/50 px-3.5 py-2 text-slate-300"
                                     {...props}
                                   />
                                 ),
+                                // Normalized inline code (Subtle, flush, baseline-aligned)
                                 code: ({
                                   node,
-                                  inline,
                                   className,
                                   children,
                                   ...props
@@ -1229,7 +1334,10 @@ export default function App() {
                                     /\n$/,
                                     "",
                                   );
-                                  if (!inline) {
+                                  const isBlock =
+                                    Boolean(match) || codeVal.includes("\n");
+
+                                  if (isBlock) {
                                     return (
                                       <CodeBlock
                                         language={match ? match[1] : ""}
@@ -1237,9 +1345,11 @@ export default function App() {
                                       />
                                     );
                                   }
+
+                                  // Sleek, normalized inline tag (Claude/GitHub style)
                                   return (
                                     <code
-                                      className="bg-slate-800/80 px-1.5 py-0.5 rounded text-sky-300 text-xs font-mono"
+                                      className="font-mono text-[0.88em] font-medium text-sky-300/90 bg-white/[0.05] border border-white/[0.08] px-1.5 py-0.5 rounded align-baseline mx-0.5"
                                       {...props}
                                     >
                                       {children}

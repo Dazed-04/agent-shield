@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel
 
 
@@ -7,6 +9,7 @@ class ChatRequest(BaseModel):
     role: str | None = "Standard Users"
     thread_id: str | None = None
     rag_context: str | None = None
+    attachment: dict[str, Any] | None = None
 
 
 class ChatResponse(BaseModel):

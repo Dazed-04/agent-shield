@@ -9,6 +9,7 @@ class SecurityAuditLog(Base):
     __tablename__ = "security_audit_logs"
 
     id = Column(Integer, primary_key=True, index=True)
+    thread_id = Column(String(64), index=True, default="default_session")
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
     prompt = Column(Text, nullable=False)
     risk_score = Column(Float, nullable=False)

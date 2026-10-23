@@ -1,0 +1,22 @@
+{
+  "api_keys": {
+    "shield_admin_key_9988": {
+      "user": "sysadmin_lead",
+      "role": "Domain Admins",
+      "allowed_interfaces": ["cli", "web"],
+      "enabled": true
+    },
+    "shield_ds_key_4411": {
+      "user": "researcher_bob",
+      "role": "Data Science",
+      "allowed_interfaces": ["web"],
+      "enabled": true
+    },
+    "shield_intern_key_0022": {
+      "user": "intern_charlie",
+      "role": "Standard Users",
+      "allowed_interfaces": ["cli"],
+      "enabled": true
+    }
+  }
+}

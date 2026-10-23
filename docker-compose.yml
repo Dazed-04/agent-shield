@@ -1,0 +1,20 @@
+services:
+  agent-shield:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agent-shield-gateway
+    ports:
+      - "8000:8000"
+    # This directly injects your API keys from the backend folder into the container
+    env_file:
+      - ./backend/.env
+    environment:
+      # These override whatever is in the .env file for production routing
+      - SECURITY_ENV=production
+      - DATABASE_URL=sqlite:////app/data/agentshield.db
+    volumes:
+      - ./sandbox:/app/sandbox
+      - ./data:/app/data
+      - ./backend/app/config:/app/app/config
+    restart: unless-stopped

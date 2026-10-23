@@ -73,6 +73,7 @@ class AgentState(TypedDict):
     final_output: str | None
     step_count: int
     thread_id: str
+    role: str
 
 
 SYSTEM_INSTRUCTION = SystemMessage(
@@ -132,8 +133,9 @@ def shield_interceptor_node(state: AgentState):
 
     tool_call = last_msg.tool_calls[0]
     t_id = state.get("thread_id", "default_session")
+    user_role = state.get("role", "Standard Users")
     inspection = tool_monitor.inspect(
-        tool_call["name"], tool_call["args"], thread_id=t_id
+        tool_call["name"], tool_call["args"], thread_id=t_id, role=user_role
     )
 
     risk_score = inspection["score"]

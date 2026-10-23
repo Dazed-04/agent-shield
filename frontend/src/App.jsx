@@ -70,7 +70,7 @@ const PRESET_PAYLOADS = [
   },
 ];
 
-// Smart Boundary-Aware Tooltip Component
+// Boundary-Safe Dim Gray Tooltip Component
 function Tooltip({ text, children, position = "top", align = "center" }) {
   const posClasses = {
     top: "bottom-full mb-2",
@@ -178,23 +178,6 @@ export default function App() {
     () => sessions[0]?.id || `session_${Date.now()}`,
   );
 
-  // Chat Title Rename State
-  const [isEditingTitle, setIsEditingTitle] = useState(false);
-  const [titleInput, setTitleInput] = useState("");
-
-  const saveSessionTitle = (newTitle) => {
-    if (!newTitle.trim()) {
-      setIsEditingTitle(false);
-      return;
-    }
-    setSessions((prev) =>
-      prev.map((s) =>
-        s.id === currentSessionId ? { ...s, title: newTitle.trim() } : s,
-      ),
-    );
-    setIsEditingTitle(false);
-  };
-
   const activeSession = sessions.find((s) => s.id === currentSessionId) ||
     sessions[0] || {
       id: "default",
@@ -212,6 +195,11 @@ export default function App() {
   const [selectedApproval, setSelectedApproval] = useState(null);
   const [expandedLog, setExpandedLog] = useState(null);
   const [attachedFile, setAttachedFile] = useState(null);
+  const [setLastSyncTime] = useState("");
+
+  // Chat Title Inline Rename State
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [titleInput, setTitleInput] = useState("");
 
   // Per-Response Collapse State
   const [collapsedResponses, setCollapsedResponses] = useState({});
@@ -220,7 +208,6 @@ export default function App() {
   const [isLeftOpen, setIsLeftOpen] = useState(true);
   const [isRightOpen, setIsRightOpen] = useState(false);
   const [activeRightTab, setActiveRightTab] = useState("artifacts"); // "artifacts" or "review"
-  const prevPendingCountRef = useRef(0);
 
   // Artifacts State
   const [selectedArtifact, setSelectedArtifact] = useState(null);
@@ -239,6 +226,7 @@ export default function App() {
   const fileInputRef = useRef(null);
   const messagesEndRef = useRef(null);
 
+  // Sync to localStorage
   useEffect(() => {
     try {
       localStorage.setItem("as_sessions", JSON.stringify(sessions));
@@ -246,18 +234,6 @@ export default function App() {
       console.error(e);
     }
   }, [sessions]);
-
-  // Auto-open review queue when new action is held
-  useEffect(() => {
-    if (
-      pendingApprovals.length > prevPendingCountRef.current &&
-      pendingApprovals.length > 0
-    ) {
-      setIsRightOpen(true);
-      setActiveRightTab("review");
-    }
-    prevPendingCountRef.current = pendingApprovals.length;
-  }, [pendingApprovals]);
 
   // Auto-resize input
   useEffect(() => {
@@ -275,25 +251,100 @@ export default function App() {
       ]);
       setAnalytics(aRes.data);
       setPendingApprovals(pRes.data);
+      setLastSyncTime("Live (SSE)");
     } catch (err) {
       console.error("Gateway offline:", err);
     }
   };
 
+  // PRODUCTION REAL-TIME SERVER-SENT EVENTS (SSE) LISTENER
   useEffect(() => {
+    // 1. Initial snapshot fetch
     fetchData();
+
+    // 2. Open persistent SSE connection
+    const eventSource = new EventSource(`${API_BASE}/events/stream`);
+
+    eventSource.onopen = () => {
+      console.log("[SSE] Connected to Agent Shield stream.");
+      setLastSyncTime("Live");
+    };
+
+    // Instant push when review actions are held or resolved
+    eventSource.addEventListener("approvals_updated", (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        const incoming = payload.approvals || [];
+        setPendingApprovals((prev) => {
+          // If a new item arrived, pop open the review drawer immediately!
+          if (incoming.length > prev.length) {
+            setIsRightOpen(true);
+            setActiveRightTab("review");
+          }
+          return incoming;
+        });
+        setLastSyncTime(
+          new Date().toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          }),
+        );
+      } catch (err) {
+        console.error("Failed to parse SSE approval payload:", err);
+      }
+    });
+
+    // Instant push when analytics / threat counts change
+    eventSource.addEventListener("analytics_updated", (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload.analytics) {
+          setAnalytics(payload.analytics);
+          setLastSyncTime(
+            new Date().toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+              second: "2-digit",
+            }),
+          );
+        }
+      } catch (err) {
+        console.error("Failed to parse SSE analytics payload:", err);
+      }
+    });
+
+    eventSource.onerror = () => {
+      // EventSource auto-reconnects natively if the server reboots
+      setLastSyncTime("Reconnecting...");
+    };
+
+    return () => {
+      eventSource.close();
+    };
   }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  // Current session block count (scoped to this chat only)
+  const saveSessionTitle = (newTitle) => {
+    if (!newTitle.trim()) {
+      setIsEditingTitle(false);
+      return;
+    }
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === currentSessionId ? { ...s, title: newTitle.trim() } : s,
+      ),
+    );
+    setIsEditingTitle(false);
+  };
+
   const currentSessionBlockedCount = messages.filter(
     (m) => m.decision === "BLOCK",
   ).length;
 
-  // Global estimated tokens processed across all sessions
   const calculateTotalTokens = () => {
     let charCount = 0;
     sessions.forEach((s) => {
@@ -301,12 +352,11 @@ export default function App() {
         charCount += (m.content || "").length;
       });
     });
-    return Math.round(charCount / 3.8); // standard ~4 chars per token approximation
+    return Math.round(charCount / 3.8);
   };
 
   const totalTokensUsed = calculateTotalTokens();
 
-  // Aggregate Artifacts (User uploads + sandbox files + auto-extracted code blocks)
   const getSessionArtifacts = () => {
     const list = [];
     messages.forEach((m, idx) => {
@@ -344,7 +394,6 @@ export default function App() {
           }
         });
       }
-      // Auto-extract inline markdown code blocks into artifacts
       if (m.role === "agent" && m.content) {
         const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
         let match;
@@ -661,7 +710,7 @@ export default function App() {
       const res = await axios.get(`${API_BASE}/logs?decision=${category}`);
       setCategoryLogs(res.data);
     } catch (err) {
-      console.error(err);
+      console.error("Failed to load category logs:", err);
     } finally {
       setLoadingCategoryLogs(false);
     }
@@ -813,7 +862,7 @@ export default function App() {
               <span className="text-[10px] font-semibold uppercase tracking-wider">
                 Gateway Telemetry
               </span>
-              <Tooltip text="Refresh Telemetry" position="top" align="right">
+              <Tooltip text="Refresh Telemetry" position="top">
                 <button onClick={fetchData} className="hover:text-sky-400">
                   <RefreshCw className="w-3 h-3" />
                 </button>
@@ -861,7 +910,7 @@ export default function App() {
       <main className="flex-1 min-w-0 h-full flex flex-col justify-between relative overflow-hidden transition-all duration-300">
         {/* Floating Left Edge Toggle */}
         {!isLeftOpen && (
-          <Tooltip text="Expand Navigation Sidebar" position="right">
+          <Tooltip text="Expand Navigation" position="right">
             <button
               onClick={() => setIsLeftOpen(true)}
               className="absolute left-3 top-3 z-30 p-2 rounded-xl bg-[#101625] border border-slate-800 hover:border-slate-700 text-slate-400 hover:text-white shadow-xl backdrop-blur-md transition flex items-center justify-center group"
@@ -874,6 +923,7 @@ export default function App() {
         {/* Top Header */}
         <header className="w-full px-4 md:px-6 py-3 border-b border-slate-800/60 text-xs flex-shrink-0 z-10 bg-[#0b0f19]">
           <div className="w-full max-w-4xl mx-auto flex items-center justify-between">
+            {/* Inline Title Editor */}
             <div className="flex items-center gap-2 pl-8 md:pl-0">
               {isEditingTitle ? (
                 <div className="flex items-center gap-1.5">
@@ -936,7 +986,7 @@ export default function App() {
                 </div>
               </Tooltip>
 
-              {/* Blocked Threats (Scoped to Current Session) */}
+              {/* Blocked Threats (Current Session Only) */}
               <Tooltip text="Threats blocked in this session" position="bottom">
                 <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-slate-400 font-mono text-[11px] select-none">
                   <Shield className="w-3.5 h-3.5 text-slate-500" />
@@ -947,10 +997,7 @@ export default function App() {
               </Tooltip>
 
               {/* Artifacts Tab Button */}
-              <Tooltip
-                text="View extracted code snippets & files"
-                position="bottom"
-              >
+              <Tooltip text="View session files & snippets" position="bottom">
                 <button
                   onClick={() => {
                     setIsRightOpen(true);
@@ -1085,7 +1132,6 @@ export default function App() {
                     </div>
                   ) : (
                     <div className="flex flex-col items-start max-w-3xl space-y-1.5">
-                      {/* Collapsed Response Bar */}
                       {collapsedResponses[idx] ? (
                         <div
                           onClick={() => toggleCollapse(idx)}
@@ -1110,9 +1156,7 @@ export default function App() {
                           )}
                         </div>
                       ) : (
-                        /* Expanded Response Card with Nested Bounded Viewport */
                         <div className="bg-[#141b2a] border border-slate-800 text-slate-200 text-sm p-3.5 rounded-2xl shadow-sm w-full space-y-2 relative group/bot">
-                          {/* Top Header of Expanded Response */}
                           <div className="flex items-center justify-between pb-2 border-b border-slate-800/60 text-xs text-slate-400">
                             <div className="flex items-center gap-2">
                               <span className="text-[11px] font-mono font-medium text-slate-400">
@@ -1147,7 +1191,6 @@ export default function App() {
                             </div>
                           </div>
 
-                          {/* Nested Scrollable Frame for Code & Markdown (Max Height Clamped) */}
                           <div className="rounded-xl bg-[#0c101c] border border-slate-800/80 p-3.5 max-h-[460px] overflow-y-auto overflow-x-auto leading-relaxed">
                             <ReactMarkdown
                               remarkPlugins={[remarkGfm]}
@@ -1209,7 +1252,6 @@ export default function App() {
                             </ReactMarkdown>
                           </div>
 
-                          {/* Telemetry Footer */}
                           {m.decision && m.logId && (
                             <div className="border border-slate-800/80 bg-slate-900/60 rounded-xl p-2 text-xs w-full">
                               <div
@@ -1363,13 +1405,12 @@ export default function App() {
         </div>
       </main>
 
-      {/* 3. OPTION B UNIFIED RIGHT TRAY (ARTIFACTS + REVIEW QUEUE) */}
+      {/* 3. OPTION B UNIFIED RIGHT TRAY */}
       <aside
         className={`border-l border-slate-800/80 bg-[#101625] flex flex-col transition-all duration-300 ease-in-out overflow-hidden z-20 flex-shrink-0 ${
           isRightOpen ? "w-80 p-4" : "w-0 p-0 border-none"
         }`}
       >
-        {/* Header & Close */}
         <div className="flex items-center justify-between pb-3 border-b border-slate-800 min-w-[280px]">
           <span className="text-xs font-bold text-white uppercase tracking-wider">
             Workspace Inspector
@@ -1519,7 +1560,7 @@ export default function App() {
         )}
       </aside>
 
-      {/* 4. ON-SCREEN ARTIFACT RENDERER MODAL */}
+      {/* 4. ARTIFACT PREVIEW MODAL */}
       {selectedArtifact && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-[#141b2a] border border-slate-700 rounded-2xl w-full max-w-2xl max-h-[85vh] flex flex-col shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150">
@@ -1533,7 +1574,7 @@ export default function App() {
                   {selectedArtifact.source}
                 </span>
               </div>
-              <Tooltip text="Close Inspector" position="left">
+              <Tooltip text="Close" position="left">
                 <button
                   onClick={() => setSelectedArtifact(null)}
                   className="text-slate-400 hover:text-slate-200"

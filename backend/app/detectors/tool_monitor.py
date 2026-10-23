@@ -1,12 +1,15 @@
+import json
+import os
 import time
 from typing import Any
+
+POLICY_FILE_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../config/policies.json")
+)
 
 
 class ToolMonitor:
     def __init__(self):
-        self.critical_tools = {"execute_python_code"}
-        self.medium_tools = {"write_sandbox_file"}
-        self.low_tools = {"read_sandbox_file"}
         self.session_leases: dict[str, dict[str, Any]] = {}
         self.dangerous_patterns = [
             "os.system",
@@ -19,6 +22,17 @@ class ToolMonitor:
             "passwd",
             "shutil.rmtree",
         ]
+        self.policies = self.load_policies()
+
+    def load_policies(self) -> dict[str, Any]:
+        """Dynamically loads policies.json if present on disk."""
+        if os.path.exists(POLICY_FILE_PATH):
+            try:
+                with open(POLICY_FILE_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"⚠️ [ToolMonitor] Failed to load policies.json: {e}")
+        return {}
 
     def grant_session_lease(
         self,
@@ -36,20 +50,26 @@ class ToolMonitor:
         }
 
     def inspect(
-        self, tool_name: str, tool_args: dict[str, Any], thread_id: str | None = None
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        thread_id: str | None = None,
+        role: str = "Standard Users",
     ) -> dict[str, Any]:
         args_str = str(tool_args).lower()
 
+        # 1. HARD SAFETY CHECK: Always block known exploit signatures
         for pattern in self.dangerous_patterns:
             if pattern in args_str:
                 return {
                     "score": 95.0,
                     "flagged": True,
                     "reasons": [
-                        f"Exploit payload '{pattern}' detected in leased tool. Immediate block."
+                        f"Exploit signature '{pattern}' detected in arguments. Hard block."
                     ],
                 }
 
+        # 2. CHECK ACTIVE SESSION LEASE
         if thread_id and thread_id in self.session_leases:
             lease = self.session_leases[thread_id].get(tool_name)
             if lease:
@@ -60,28 +80,59 @@ class ToolMonitor:
                         "score": 15.0,
                         "flagged": False,
                         "reasons": [
-                            (
-                                f"Authorized via active session lease (Expires in {int(lease['expires_at'] - now)}s, "
-                                f"{lease['remaining_uses']} uses remaining)."
-                            )
+                            f"Authorized via active session lease ({lease['remaining_uses']} uses remaining)."
                         ],
                     }
 
-        if tool_name in self.critical_tools:
+        # 3. EVALUATE POLICIES.JSON BASED ON CALLER'S ROLE
+        role_config = self.policies.get("roles", {}).get(role)
+        if role_config:
+            tool_policy = role_config.get("tools", {}).get(tool_name)
+            if tool_policy:
+                policy_action = tool_policy.get("policy", "APPROVE")
+
+                # Check disallowed argument patterns specific to this role
+                disallowed = tool_policy.get("disallowed_patterns", [])
+                for d_pat in disallowed:
+                    if d_pat.lower() in args_str:
+                        return {
+                            "score": 90.0,
+                            "flagged": True,
+                            "reasons": [
+                                f"Argument pattern '{d_pat}' forbidden for role '{role}'."
+                            ],
+                        }
+
+                if policy_action == "ALLOW":
+                    return {
+                        "score": 15.0,
+                        "flagged": False,
+                        "reasons": [
+                            f"Role '{role}' is pre-authorized for '{tool_name}'."
+                        ],
+                    }
+                elif policy_action == "DENY":
+                    return {
+                        "score": 85.0,
+                        "flagged": True,
+                        "reasons": [
+                            f"Role '{role}' is forbidden from invoking '{tool_name}'."
+                        ],
+                    }
+                else:  # APPROVE
+                    return {
+                        "score": 55.0,
+                        "flagged": True,
+                        "reasons": [
+                            f"Role '{role}' requires human approval for '{tool_name}'."
+                        ],
+                    }
+
+        # 4. DEFAULT FALLBACK RULES (if role not found in policies.json)
+        if tool_name == "execute_python_code":
             return {
                 "score": 55.0,
                 "flagged": True,
-                "reasons": [
-                    f"Tool '{tool_name}' requests system runtime code execution. Human approval required."
-                ],
+                "reasons": [f"Default policy: '{tool_name}' requires human approval."],
             }
-        elif tool_name in self.medium_tools:
-            return {
-                "score": 30.0,
-                "flagged": False,
-                "reasons": [
-                    f"Tool '{tool_name}' performs filesystem write operations."
-                ],
-            }
-
         return {"score": 5.0, "flagged": False, "reasons": ["Standard safe tool call."]}

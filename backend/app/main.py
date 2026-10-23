@@ -2,7 +2,18 @@ import os
 import re
 from typing import Annotated, Any, cast
 
-from fastapi import Depends, FastAPI, HTTPException
+
+import asyncio
+import json
+import os
+import re
+from typing import Annotated, Any, AsyncGenerator, cast
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,6 +53,32 @@ jailbreak_detector = JailbreakDetector()
 response_scanner = ResponseScanner()
 
 
+class SSEBroadcaster:
+    """Manages persistent SSE connections and pushes real-time gateway events."""
+
+    def __init__(self) -> None:
+        self.subscribers: set[asyncio.Queue[tuple[str, Any]]] = set()
+
+    async def subscribe(self) -> asyncio.Queue[tuple[str, Any]]:
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        self.subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[tuple[str, Any]]) -> None:
+        self.subscribers.discard(queue)
+
+    def publish_sync(self, event_type: str, data: Any) -> None:
+        """Thread-safe push to all connected browser clients."""
+        for queue in list(self.subscribers):
+            try:
+                queue.put_nowait((event_type, data))
+            except Exception:  # noqa: BLE001
+                self.subscribers.discard(queue)
+
+
+broadcaster = SSEBroadcaster()
+
+
 def serialize_log(log: Any) -> dict[str, Any]:
     return {
         "id": int(log.id),
@@ -59,6 +96,63 @@ def serialize_log(log: Any) -> dict[str, Any]:
         "final_response": str(log.final_response) if log.final_response else None,
         "status": str(log.status),
     }
+
+
+def get_pending_approvals_list(db: Session) -> list[dict[str, Any]]:
+    logs = (
+        db.query(SecurityAuditLog)
+        .filter(SecurityAuditLog.status == "PENDING_REVIEW")
+        .all()
+    )
+    return [serialize_log(l) for l in logs]
+
+
+def get_analytics_payload(db: Session) -> dict[str, Any]:
+    logs = db.query(SecurityAuditLog).all()
+    total = len(logs)
+    counts: dict[str, int] = {"ALLOW": 0, "WARN": 0, "APPROVE": 0, "BLOCK": 0}
+    for item in logs:
+        key = str(item.decision)
+        counts[key] = counts.get(key, 0) + 1
+    recent = logs[-10:] if total > 10 else logs
+    return {
+        "total_requests": total,
+        "breakdown": counts,
+        "recent_logs": [serialize_log(l) for l in recent],
+    }
+
+
+@app.get("/api/events/stream")
+async def event_stream(request: Request) -> StreamingResponse:
+    """Persistent Server-Sent Events stream for zero-polling real-time updates."""
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        queue = await broadcaster.subscribe()
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    # Wait for next event with a 15-second heartbeat
+                    event_type, payload = await asyncio.wait_for(
+                        queue.get(), timeout=15.0
+                    )
+                    yield f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+                except asyncio.TimeoutError:
+                    # Standard SSE keep-alive comment
+                    yield ": keep-alive\n\n"
+        finally:
+            broadcaster.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -110,6 +204,7 @@ def handle_chat_request(
         "final_output": None,
         "step_count": 0,
         "thread_id": thread_id,
+        "role": req.role or "Standard Users",
     }
 
     try:
@@ -135,6 +230,38 @@ def handle_chat_request(
             approval_needed=False,
         )
 
+    # 1. CHECK: Did LangGraph tool inspection block the action?
+    if final_state.get("status") == "BLOCKED" or final_state.get("risk_score", 0) > 80:
+        audit_entry.decision = "BLOCK"
+        audit_entry.risk_score = float(final_state.get("risk_score", 85.0))
+        audit_entry.justification = final_state.get(
+            "justification", "Tool execution blocked by security policy."
+        )
+        audit_entry.final_response = (
+            final_state.get("final_output")
+            or f"[SECURITY FIREWALL]: Execution blocked by policy for role '{req.role}'."
+        )
+        audit_entry.status = "COMPLETED"
+        audit_entry.tool_calls_attempted = (
+            [final_state["pending_tool_call"]]
+            if final_state.get("pending_tool_call")
+            else []
+        )
+        db.add(audit_entry)
+        db.commit()
+        db.refresh(audit_entry)
+
+        return ChatResponse(
+            log_id=int(audit_entry.id),
+            decision="BLOCK",
+            risk_score=audit_entry.risk_score,
+            justification=audit_entry.justification,
+            reply=audit_entry.final_response,
+            replies=[audit_entry.final_response],
+            approval_needed=False,
+        )
+
+    # 2. CHECK: Did LangGraph pause for human approval?
     if final_state.get("status") == "WAITING_APPROVAL" or (
         final_state.get("pending_tool_call") and final_state.get("risk_score", 0) >= 50
     ):
@@ -155,6 +282,14 @@ def handle_chat_request(
         db.add(audit_entry)
         db.commit()
         db.refresh(audit_entry)
+
+        # REAL-TIME SSE PUSH: Notify browser clients immediately
+        broadcaster.publish_sync(
+            "approvals_updated", {"approvals": get_pending_approvals_list(db)}
+        )
+        broadcaster.publish_sync(
+            "analytics_updated", {"analytics": get_analytics_payload(db)}
+        )
 
         hold_msg = (
             f"⏸️ **[SECURITY HOLD]**: The agent attempted to execute privileged tool `{tool_name}`. "
@@ -188,6 +323,11 @@ def handle_chat_request(
     db.commit()
     db.refresh(audit_entry)
 
+    # REAL-TIME SSE PUSH: Refresh telemetry counts
+    broadcaster.publish_sync(
+        "analytics_updated", {"analytics": get_analytics_payload(db)}
+    )
+
     split_chunks = re.split(
         r"(?:---|###|\n\n)\s*(?:Response|Message)\s*\d+\s*(?:---|:)?\s*", raw_final
     )
@@ -208,7 +348,11 @@ def handle_chat_request(
 @app.get("/api/approvals/pending")
 def list_pending_approvals(
     db: Annotated[Session, Depends(get_db)],
+    response: Response,
 ) -> list[dict[str, Any]]:
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     logs = (
         db.query(SecurityAuditLog)
         .filter(SecurityAuditLog.status == "PENDING_REVIEW")
@@ -257,6 +401,15 @@ def resolve_approval(
         decision_label = "REJECTED"
 
     db.commit()
+
+    # REAL-TIME SSE PUSH: Refresh queue and analytics
+    broadcaster.publish_sync(
+        "approvals_updated", {"approvals": get_pending_approvals_list(db)}
+    )
+    broadcaster.publish_sync(
+        "analytics_updated", {"analytics": get_analytics_payload(db)}
+    )
+
     return {
         "status": "success",
         "log_id": log.id,

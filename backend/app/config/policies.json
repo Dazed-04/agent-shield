@@ -1,0 +1,43 @@
+{
+  "roles": {
+    "Domain Admins": {
+      "default_policy": "ALLOW",
+      "tools": {
+        "execute_python_code": {
+          "policy": "ALLOW",
+          "max_invocations_per_session": 50,
+          "disallowed_patterns": ["os.system", "rm -rf", "shutil.rmtree"]
+        },
+        "write_sandbox_file": {
+          "policy": "ALLOW",
+          "allowed_extensions": [".txt", ".md", ".json", ".csv"]
+        }
+      }
+    },
+    "Data Science": {
+      "default_policy": "APPROVE",
+      "tools": {
+        "execute_python_code": {
+          "policy": "APPROVE",
+          "lease_duration_seconds": 600,
+          "lease_max_uses": 3,
+          "disallowed_patterns": ["import os", "import subprocess", "open("]
+        },
+        "read_sandbox_file": {
+          "policy": "ALLOW"
+        },
+        "write_sandbox_file": {
+          "policy": "WARN"
+        }
+      }
+    },
+    "Standard Users": {
+      "default_policy": "DENY",
+      "tools": {
+        "execute_python_code": { "policy": "DENY" },
+        "read_sandbox_file": { "policy": "ALLOW" },
+        "write_sandbox_file": { "policy": "DENY" }
+      }
+    }
+  }
+}

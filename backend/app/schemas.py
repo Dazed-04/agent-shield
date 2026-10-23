@@ -4,6 +4,7 @@ from pydantic import BaseModel
 class ChatRequest(BaseModel):
     prompt: str
     user_id: str | None = "default_user"
+    role: str | None = "Standard Users"
     thread_id: str | None = None
     rag_context: str | None = None
 

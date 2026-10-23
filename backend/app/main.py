@@ -1,8 +1,11 @@
+import os
 import re
 from typing import Annotated, Any, cast
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from sqlalchemy.orm import Session
@@ -309,3 +312,21 @@ def grant_lease(req: GrantLeaseRequest) -> dict[str, Any]:
             f"(Limit: {req.max_uses} calls, {req.duration_seconds}s)."
         ),
     }
+
+
+FRONTEND_DIST = os.path.abspath("../frontend/dist")
+
+if os.path.exists(FRONTEND_DIST):
+    app.mount(
+        "/assets",
+        StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")),
+        name="assets",
+    )
+
+    @app.get("/{full_path:path}")
+    def serve_frontend_spa(full_path: str):
+        # Allow API routes to pass through
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404)
+        index_file = os.path.join(FRONTEND_DIST, "index.html")
+        return FileResponse(index_file)

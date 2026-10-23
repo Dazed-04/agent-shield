@@ -1,0 +1,43 @@
+# Environments & Secrets
+.env
+*.env
+backend/.env
+venv/
+.venv/
+ENV/
+
+# Databases & Runtime State
+*.db
+*.sqlite3
+agentshield.db
+backend/agentshield.db
+
+# Sandboxed Execution Dirs
+sandbox/
+backend/sandbox/
+**/sandbox/
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS & Editor Metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo

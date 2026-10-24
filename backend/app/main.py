@@ -6,6 +6,7 @@ import re
 from collections.abc import AsyncGenerator
 from typing import Annotated, Any, cast
 
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -17,7 +18,6 @@ from sqlalchemy.orm import Session
 
 from app.agent.langgraph_agent import AgentState, compiled_agent
 from app.agent.tools import TOOLS_BY_NAME
-from app.config import SECURITY_ENV
 from app.database import Base, engine, get_db
 from app.detectors.jailbreak_detector import JailbreakDetector
 from app.detectors.prompt_scanner import PromptScanner
@@ -34,6 +34,11 @@ from app.schemas import (
 USERS_FILE_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "config/users.json")
 )
+
+
+def get_security_env() -> str:
+    """Dynamically reads the security environment to support zero-downtime hot reloading."""
+    return os.getenv("SECURITY_ENV", "development").lower()
 
 
 def load_user_registry() -> dict[str, Any]:
@@ -101,6 +106,42 @@ class SSEBroadcaster:
 
 
 broadcaster = SSEBroadcaster()
+
+ENV_FILE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.env"))
+BACKEND_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.env"))
+
+
+def reload_all_system_configs() -> dict[str, Any]:
+    """Reloads .env, policies.json, users.json, and resets key rotation pools entirely at runtime."""
+    reloaded_items = []
+
+    for path in (BACKEND_ENV_PATH, ENV_FILE_PATH):
+        if os.path.exists(path):
+            load_dotenv(dotenv_path=path, override=True)
+            reloaded_items.append(f"env ({os.path.basename(path)})")
+
+    from app.agent.langgraph_agent import tool_monitor
+
+    tool_monitor.policies = tool_monitor.load_policies()
+    reloaded_items.append("policies.json")
+
+    from app.agent.model_factory import _PROVIDER_KEY_CYCLERS
+
+    _PROVIDER_KEY_CYCLERS.clear()
+    reloaded_items.append("models.json & API key pools")
+
+    broadcaster.publish_sync(
+        "analytics_updated", {"analytics": get_analytics_payload(db=next(get_db()))}
+    )
+
+    print(f"🔄 [Agent Shield] Hot-Reloaded configurations: {', '.join(reloaded_items)}")
+    return {
+        "status": "success",
+        "reloaded": reloaded_items,
+        "timestamp": os.path.getmtime(BACKEND_ENV_PATH)
+        if os.path.exists(BACKEND_ENV_PATH)
+        else None,
+    }
 
 
 def serialize_log(log: Any) -> dict[str, Any]:
@@ -181,27 +222,18 @@ async def event_stream(request: Request) -> StreamingResponse:
 def resolve_authenticated_context(
     request: Request, req: ChatRequest
 ) -> tuple[str, str]:
-    """
-    Dual-Mode Authenticator:
-    - In Development: Allows client-specified role and bypasses interface checks.
-    - In Production: Enforces API Key, validates allowed interfaces, and resolves server-side role.
-    """
+    """Dual-Mode Authenticator (Development Permissive vs. Production Zero-Trust)."""
     client_interface = request.headers.get("X-Client-Interface", "web").lower()
 
-    # --- MODE A: DEVELOPMENT (Testing & Local Verification) ---
-    if SECURITY_ENV == "development":
+    if get_security_env() == "development":
         effective_role = req.role or "Standard Users"
-        print(
-            f"🛠️ [Agent Shield DEV MODE] Permissive role accepted from client: '{effective_role}' (Interface: {client_interface})"
-        )
         return effective_role, client_interface
 
-    # --- MODE B: PRODUCTION (Strict Zero-Trust Enforcement) ---
     api_key = request.headers.get("X-API-Key", "").strip()
     if not api_key:
         raise HTTPException(
             status_code=401,
-            detail="[SECURITY VIOLATION]: Production mode requires a valid X-API-Key header.",
+            detail="Production mode requires a valid X-API-Key header.",
         )
 
     registry = load_user_registry()
@@ -210,26 +242,60 @@ def resolve_authenticated_context(
     if not user_data or not user_data.get("enabled", False):
         raise HTTPException(
             status_code=401,
-            detail="[SECURITY VIOLATION]: Invalid or revoked API Key.",
+            detail="Invalid or revoked API Key.",
         )
 
-    # 1. Interface Restriction Check (e.g. Disallow CLI if user is restricted to web)
     allowed_interfaces = user_data.get("allowed_interfaces", ["web"])
     if client_interface not in allowed_interfaces:
         raise HTTPException(
             status_code=403,
             detail=(
-                f"[SECURITY VIOLATION]: User '{user_data.get('user')}' is not authorized to access "
-                f"Agent Shield via '{client_interface}'. Allowed interfaces: {allowed_interfaces}."
+                f"User '{user_data.get('user')}' is not authorized to access "
+                f"via '{client_interface}'. Allowed interfaces: {allowed_interfaces}."
             ),
         )
 
-    # 2. Server binds the real role (client-supplied req.role is strictly discarded)
     server_bound_role = user_data.get("role", "Standard Users")
-    print(
-        f"🔒 [Agent Shield PROD MODE] Authenticated '{user_data.get('user')}' -> Bound Role: '{server_bound_role}'"
-    )
     return server_bound_role, client_interface
+
+
+@app.get("/api/auth/verify")
+def verify_auth(request: Request) -> dict[str, Any]:
+    """Pre-flight handshake for CLI and Web clients to verify credentials."""
+    client_interface = request.headers.get("X-Client-Interface", "web").lower()
+
+    if get_security_env() == "development":
+        return {"status": "ok", "mode": "development", "role": "Unbound (Dev Mode)"}
+
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        # Return 200 with mode so the UI knows to switch to production mode without crashing
+        return {
+            "status": "unauthenticated",
+            "mode": "production",
+            "role": "Standard Users",
+            "authenticated": False,
+        }
+
+    registry = load_user_registry()
+    user_data = registry.get("api_keys", {}).get(api_key)
+    if not user_data or not user_data.get("enabled", False):
+        raise HTTPException(status_code=401, detail="Invalid or revoked API Key.")
+
+    allowed_interfaces = user_data.get("allowed_interfaces", ["web"])
+    if client_interface not in allowed_interfaces:
+        raise HTTPException(
+            status_code=403,
+            detail=f"User '{user_data.get('user')}' is restricted to interfaces: {allowed_interfaces}.",
+        )
+
+    return {
+        "status": "ok",
+        "mode": "production",
+        "role": user_data.get("role", "Standard Users"),
+        "user": user_data.get("user"),
+        "authenticated": True,
+    }
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -238,8 +304,8 @@ def handle_chat_request(
     req: ChatRequest,
     db: Annotated[Session, Depends(get_db)],
 ) -> ChatResponse:
-    # 1. Resolve Identity, Effective Role & Interface via Dual-Mode Authenticator
-    effective_role, _ = resolve_authenticated_context(request, req)
+    # 1. Resolve Identity, Effective Role & Interface
+    effective_role, client_interface = resolve_authenticated_context(request, req)
 
     # 2. Resolve Session Thread ID
     thread_id = req.thread_id or "default_session"
@@ -254,7 +320,7 @@ def handle_chat_request(
             f"{req.prompt}\n\n--- Attached File ({att_name}) ---\n{att_content}"
         )
 
-    # 4. Inbound Layer 1 Security Scan (Scans prompt + attached payload)
+    # 4. Inbound Layer 1 Security Scan
     p_res = prompt_scanner.scan(execution_prompt, req.rag_context)
     j_res = jailbreak_detector.scan(execution_prompt)
     inbound_score, decision, justification = RiskEngine.aggregate_and_decide(
@@ -272,12 +338,12 @@ def handle_chat_request(
         status="COMPLETED",
     )
 
-    # Broadcast helper defined in scope before any returns
     def broadcast_chat_update(reply_text: str, replies: list[str]) -> None:
         broadcaster.publish_sync(
             "chat_message",
             {
                 "session_id": thread_id,
+                "client_interface": client_interface,
                 "log_id": int(audit_entry.id),
                 "prompt": req.prompt,
                 "attachment": req.attachment,
@@ -291,7 +357,6 @@ def handle_chat_request(
             },
         )
 
-    # Inbound BLOCK Decision
     if decision == "BLOCK":
         block_msg = "[SECURITY BLOCK]: Action aborted by Agent Shield. Direct prompt injection or adversarial phrasing identified."
         audit_entry.final_response = block_msg
@@ -323,6 +388,7 @@ def handle_chat_request(
         "final_output": None,
         "step_count": 0,
         "thread_id": thread_id,
+        "model_id": req.model_id,
         "role": effective_role,
     }
 
@@ -411,7 +477,6 @@ def handle_chat_request(
         db.commit()
         db.refresh(audit_entry)
 
-        # Real-time SSE push
         broadcaster.publish_sync(
             "approvals_updated", {"approvals": get_pending_approvals_list(db)}
         )
@@ -439,12 +504,11 @@ def handle_chat_request(
 
     raw_final: str = str(final_state.get("final_output") or "Task completed.")
     audit_entry.final_response = raw_final
-    # Extract all successfully executed tools from the message history
+
     executed_tools = []
     for msg in final_state.get("messages", []):
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             executed_tools.extend(msg.tool_calls)
-
     audit_entry.tool_calls_attempted = executed_tools
 
     db.add(audit_entry)
@@ -471,6 +535,30 @@ def handle_chat_request(
         replies=final_replies,
         approval_needed=False,
     )
+
+
+@app.get("/api/providers")
+def list_providers() -> list[dict[str, Any]]:
+    from app.agent.model_factory import load_model_registry
+
+    providers = load_model_registry()
+    return [
+        {
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "type": p.get("type"),
+            "model": p.get("model"),
+            "keys_configured": len(p.get("resolved_keys", [])),
+        }
+        for p in providers
+    ]
+
+
+@app.get("/api/models")
+def get_available_models() -> list[dict[str, Any]]:
+    from app.agent.model_factory import get_available_models_for_ui
+
+    return get_available_models_for_ui()
 
 
 @app.get("/api/approvals/pending")
@@ -504,13 +592,14 @@ def resolve_approval(
             try:
                 raw_result = tool_obj.invoke(tool_call.get("args", {}))
                 sanitized = response_scanner.scan(str(raw_result))["sanitized_response"]
-                execution_output = f"\n\n**Execution Result:**\n```\n{sanitized}\n```"
+                execution_output = f"```\n{sanitized}\n```"
             except (RuntimeError, ValueError, OSError) as e:
-                execution_output = f"\n\n**Tool Error:** {e!s}"
+                execution_output = f"Execution error: {e!s}"
 
+        # Clean output without repetitive boilerplate headers
         log.final_response = (
-            f"✅ **[AUTHORIZED BY OPERATOR]**: Execution of `{tool_call.get('name') if tool_call else 'tool'}` "
-            f"was explicitly approved and completed.{execution_output}"
+            execution_output
+            or f"Tool `{tool_call.get('name') if tool_call else 'tool'}` completed."
         )
         decision_label = "AUTHORIZED"
     else:
@@ -520,7 +609,7 @@ def resolve_approval(
             if log.tool_calls_attempted
             else "tool"
         )
-        log.final_response = f"❌ **[DENIED BY OPERATOR]**: Execution of `{tool_name}` was cancelled by the human reviewer."
+        log.final_response = f"Execution of `{tool_name}` was cancelled."
         decision_label = "REJECTED"
 
     db.commit()
@@ -579,7 +668,6 @@ def grant_lease(req: GrantLeaseRequest) -> dict[str, Any]:
 
 @app.get("/api/sessions")
 def get_all_sessions(db: Annotated[Session, Depends(get_db)]) -> list[dict[str, Any]]:
-    """Returns all unique conversational threads from the audit database."""
     logs: list[Any] = (
         db.query(SecurityAuditLog).order_by(SecurityAuditLog.id.desc()).all()
     )
@@ -610,7 +698,6 @@ def get_all_sessions(db: Annotated[Session, Depends(get_db)]) -> list[dict[str, 
 def get_session_messages(
     thread_id: str, db: Annotated[Session, Depends(get_db)]
 ) -> list[dict[str, Any]]:
-    """Loads all historical messages for a specific session thread."""
     logs: list[Any] = (
         db.query(SecurityAuditLog)
         .filter(SecurityAuditLog.thread_id == thread_id)
@@ -644,6 +731,11 @@ def get_session_messages(
     return result
 
 
+@app.post("/api/config/reload")
+def trigger_config_reload() -> dict[str, Any]:
+    return reload_all_system_configs()
+
+
 # Static Frontend SPA Serving MUST BE AT THE VERY BOTTOM (so it doesn't shadow /api routes)
 if os.path.exists(FRONTEND_DIST):
     assets_dir = os.path.join(FRONTEND_DIST, "assets")
@@ -653,57 +745,6 @@ if os.path.exists(FRONTEND_DIST):
             StaticFiles(directory=assets_dir),
             name="assets",
         )
-
-    @app.get("/api/auth/verify")
-    def verify_auth(request: Request) -> dict[str, Any]:
-        """Pre-flight handshake to verify API Keys and Interface Entitlements."""
-        import contextlib
-        import json
-        import os
-
-        from app.config import SECURITY_ENV
-
-        client_interface = request.headers.get("X-Client-Interface", "web").lower()
-
-        # Dev Mode allows everyone
-        if SECURITY_ENV == "development":
-            return {"status": "ok", "mode": "development", "role": "Unbound (Dev Mode)"}
-
-        # Production Mode Strict Checks
-        api_key = request.headers.get("X-API-Key", "").strip()
-        if not api_key:
-            raise HTTPException(
-                status_code=401,
-                detail="Production mode requires a valid X-API-Key header.",
-            )
-
-        registry = {"api_keys": {}}
-        USERS_FILE_PATH = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "config/users.json")
-        )
-        if os.path.exists(USERS_FILE_PATH):
-            with contextlib.suppress(Exception) and open(
-                USERS_FILE_PATH, "r", encoding="utf-8"
-            ) as f:
-                registry = json.load(f)
-
-        user_data = registry.get("api_keys", {}).get(api_key)
-        if not user_data or not user_data.get("enabled", False):
-            raise HTTPException(status_code=401, detail="Invalid or revoked API Key.")
-
-        allowed_interfaces = user_data.get("allowed_interfaces", ["web"])
-        if client_interface not in allowed_interfaces:
-            raise HTTPException(
-                status_code=403,
-                detail=f"User '{user_data.get('user')}' is restricted to interfaces: {allowed_interfaces}. Access via '{client_interface}' denied.",
-            )
-
-        return {
-            "status": "ok",
-            "mode": "production",
-            "role": user_data.get("role", "Standard Users"),
-            "user": user_data.get("user"),
-        }
 
     @app.get("/{full_path:path}")
     def serve_frontend_spa(full_path: str) -> FileResponse:

@@ -1,19 +1,16 @@
 import logging
-import os
 from typing import Any, TypedDict
 
-from groq import APIError, Groq
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     SystemMessage,
     ToolMessage,
 )
-from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
-from pydantic import SecretStr
 
+from app.agent.model_factory import get_configured_llm
 from app.agent.tools import ALL_TOOLS, TOOLS_BY_NAME
 from app.detectors.response_scanner import ResponseScanner
 from app.detectors.tool_monitor import ToolMonitor
@@ -22,46 +19,6 @@ logger = logging.getLogger(__name__)
 
 tool_monitor = ToolMonitor()
 response_scanner = ResponseScanner()
-
-ACTIVE_GROQ_MODEL: str | None = None
-
-
-def get_available_groq_model(api_key: str) -> str:
-    global ACTIVE_GROQ_MODEL
-    if ACTIVE_GROQ_MODEL:
-        return ACTIVE_GROQ_MODEL
-
-    try:
-        client = Groq(api_key=api_key)
-        raw_models = [m.id for m in client.models.list().data]
-        blacklist = ["safeguard", "guard", "whisper", "orpheus", "vision", "embed"]
-        chat_models = [
-            m for m in raw_models if not any(b in m.lower() for b in blacklist)
-        ]
-
-        priority_keywords = [
-            "llama-3.3-70b",
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-            "llama-3.1-8b",
-        ]
-        for kw in priority_keywords:
-            for model_id in chat_models:
-                if kw in model_id.lower():
-                    ACTIVE_GROQ_MODEL = model_id
-                    print(
-                        f"⚡ [Agent Shield] Bound LangGraph to model: {ACTIVE_GROQ_MODEL}"
-                    )
-                    return ACTIVE_GROQ_MODEL
-
-        if chat_models:
-            ACTIVE_GROQ_MODEL = chat_models[0]
-            return ACTIVE_GROQ_MODEL
-    except (APIError, KeyError, IndexError, ValueError, ConnectionError) as e:
-        logger.warning("Groq auto-detect failed: %s", e)
-
-    ACTIVE_GROQ_MODEL = "llama-3.3-70b-versatile"
-    return ACTIVE_GROQ_MODEL
 
 
 class AgentState(TypedDict):
@@ -73,14 +30,16 @@ class AgentState(TypedDict):
     final_output: str | None
     step_count: int
     thread_id: str
+    model_id: str | None
     role: str
 
 
 SYSTEM_INSTRUCTION = SystemMessage(
     content=(
-        "You are an AI Agent protected by the Agent Shield security framework. "
+        "You are Agent Shield, an autonomous enterprise AI agent operating under the Agent Shield security framework. "
+        "You are NOT ChatGPT and must never refer to yourself as ChatGPT, OpenAI, or Google. Maintain this identity strictly.\n"
         "Provide direct, concise, and structured responses using clean Markdown. "
-        "Avoid unnecessary conversational filler or overly long essays unless explicitly asked."
+        "Avoid unnecessary conversational filler or overly long essays unless explicitly asked.\n"
         "Formatting Guidelines:\n"
         "- Do NOT enclose regular sentences or output phrases in backticks.\n"
         "- Reserve single backticks (`...`) strictly for filenames, tool names, shell commands, and code variables.\n"
@@ -90,21 +49,14 @@ SYSTEM_INSTRUCTION = SystemMessage(
 )
 
 
-def get_llm():
-    groq_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not groq_key:
-        raise ValueError("GROQ_API_KEY missing from backend/.env")
-    model_name = get_available_groq_model(groq_key)
-    return ChatGroq(
-        model=model_name,
-        api_key=SecretStr(groq_key),
-        temperature=0.2,
-        max_tokens=800,
-    ).bind_tools(ALL_TOOLS)
+def get_llm(model_id: str | None = None):
+    """Loads requested model (or default priority failover) from models.json."""
+    llm_with_tools, _ = get_configured_llm(ALL_TOOLS, requested_id=model_id)
+    return llm_with_tools
 
 
 def agent_node(state: AgentState):
-    llm = get_llm()
+    llm = get_llm(state.get("model_id"))
     messages = state["messages"]
     if not messages or not isinstance(messages[0], SystemMessage):
         messages = [SYSTEM_INSTRUCTION, *messages]

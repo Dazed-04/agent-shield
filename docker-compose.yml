@@ -11,7 +11,7 @@ services:
       - ./backend/.env
     environment:
       # These override whatever is in the .env file for production routing
-      - SECURITY_ENV=production
+      #- SECURITY_ENV=production
       - DATABASE_URL=sqlite:////app/data/agentshield.db
     volumes:
       - ./sandbox:/app/sandbox

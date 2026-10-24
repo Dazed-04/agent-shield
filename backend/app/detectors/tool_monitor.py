@@ -56,6 +56,13 @@ class ToolMonitor:
         thread_id: str | None = None,
         role: str = "Standard Users",
     ) -> dict[str, Any]:
+
+        if os.path.exists(POLICY_FILE_PATH):
+            current_mtime = os.path.getmtime(POLICY_FILE_PATH)
+            if getattr(self, "_last_policy_mtime", 0) != current_mtime:
+                self.policies = self.load_policies()
+                self._last_policy_mtime = current_mtime
+
         args_str = str(tool_args).lower()
 
         # 1. HARD SAFETY CHECK: Always block known exploit signatures

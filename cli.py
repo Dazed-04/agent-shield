@@ -121,6 +121,7 @@ def cli_tab_completer(text: str, state: int) -> str | None:
         "/view ",
         "/artifacts",
         "/role ",
+        "/reload",
         "pending",
         "exit",
         "quit",
@@ -384,6 +385,17 @@ def main() -> None:
 
             attachment_data = None
             prompt_text = raw_input_text
+
+            if raw_input_text == "/reload":
+                try:
+                    res = requests.post(f"{GATEWAY_URL}/config/reload", timeout=5)
+                    data = res.json()
+                    print(
+                        f"\033[32m✔ Gateway Hot-Reload Complete: {', '.join(data.get('reloaded', []))}\033[0m\n"
+                    )
+                except Exception as e:
+                    print(f"\033[31m[Reload Error]: {e}\033[0m\n")
+                continue
 
             if raw_input_text.startswith("/attach "):
                 parts = raw_input_text.split(" ", 2)

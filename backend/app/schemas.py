@@ -8,6 +8,7 @@ class ChatRequest(BaseModel):
     user_id: str | None = "default_user"
     role: str | None = "Standard Users"
     thread_id: str | None = None
+    model_id: str | None = None
     rag_context: str | None = None
     attachment: dict[str, Any] | None = None
 

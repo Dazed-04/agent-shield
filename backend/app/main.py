@@ -1,10 +1,13 @@
 import asyncio
-import contextlib
 import json
+import logging
 import os
 import re
+import time
+import uuid
 from collections.abc import AsyncGenerator
-from typing import Annotated, Any, cast
+from contextlib import asynccontextmanager
+from typing import Annotated, Any
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -12,54 +15,64 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
-from langchain_core.runnables import RunnableConfig
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.agent.langgraph_agent import AgentState, compiled_agent
 from app.agent.tools import TOOLS_BY_NAME
-from app.database import get_db, init_db
+from app.auth import Principal, authenticate, is_development, require_admin, require_user
+from app.config import CORS_ORIGINS
+from app.database import SessionLocal, get_db, init_db
 from app.engine.risk_engine import RiskEngine
+from app.events import broadcaster
 from app.models import SecurityAuditLog
-from app.shield import jailbreak_detector, prompt_scanner, response_scanner
 from app.schemas import (
     ChatRequest,
     ChatResponse,
     GrantLeaseRequest,
     ResolveApprovalRequest,
 )
-
-USERS_FILE_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "config/users.json")
+from app.shield import (
+    jailbreak_detector,
+    prompt_scanner,
+    response_scanner,
+    tool_monitor,
 )
 
+logger = logging.getLogger("agent_shield")
 
-def get_security_env() -> str:
-    """Dynamically reads the security environment to support zero-downtime hot reloading."""
-    return os.getenv("SECURITY_ENV", "development").lower()
-
-
-def load_user_registry() -> dict[str, Any]:
-    if os.path.exists(USERS_FILE_PATH):
-        with contextlib.suppress(Exception) and open(
-            USERS_FILE_PATH, "r", encoding="utf-8"
-        ) as f:
-            return json.load(f)
-    return {"api_keys": {}}
+DbSession = Annotated[Session, Depends(get_db)]
+User = Annotated[Principal, Depends(require_user)]
+Admin = Annotated[Principal, Depends(require_admin)]
 
 
-init_db()
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    mode = await asyncio.to_thread(jailbreak_detector.warmup)
+    logger.info("Jailbreak detector mode: %s", "semantic" if mode else "heuristic fallback")
+    if is_development():
+        logger.warning(
+            "SECURITY_ENV=development: roles are client-declared and admin endpoints are OPEN. "
+            "Never expose this mode beyond localhost."
+        )
+    yield
 
-app = FastAPI(title="Agent Shield - Production Gateway", version="2.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(title="Agent Shield - Security Gateway", version="2.1.0", lifespan=lifespan)
+
+_origins = CORS_ORIGINS or (
+    ["http://localhost:5173", "http://127.0.0.1:5173"] if is_development() else []
 )
+if _origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_origins,
+        allow_credentials=False,  # auth is via X-API-Key header, not cookies
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-API-Key", "X-Client-Interface"],
+    )
 
-# Resolve frontend dist whether running locally or inside Docker container
 _candidates = [
     os.path.abspath("./frontend/dist"),
     os.path.abspath("../frontend/dist"),
@@ -67,79 +80,18 @@ _candidates = [
 ]
 FRONTEND_DIST = next((p for p in _candidates if os.path.exists(p)), _candidates[1])
 
-
-
-class SSEBroadcaster:
-    """Manages persistent SSE connections and pushes real-time gateway events."""
-
-    def __init__(self) -> None:
-        self.subscribers: set[asyncio.Queue[tuple[str, Any]]] = set()
-
-    async def subscribe(self) -> asyncio.Queue[tuple[str, Any]]:
-        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-        self.subscribers.add(queue)
-        return queue
-
-    def unsubscribe(self, queue: asyncio.Queue[tuple[str, Any]]) -> None:
-        self.subscribers.discard(queue)
-
-    def publish_sync(self, event_type: str, data: Any) -> None:
-        """Thread-safe push to all connected browser clients."""
-        for queue in list(self.subscribers):
-            try:
-                queue.put_nowait((event_type, data))
-            except Exception:  # noqa: BLE001
-                self.subscribers.discard(queue)
-
-
-broadcaster = SSEBroadcaster()
-
 ENV_FILE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.env"))
 BACKEND_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.env"))
 
 
-def reload_all_system_configs() -> dict[str, Any]:
-    """Reloads .env, policies.json, users.json, and resets key rotation pools entirely at runtime."""
-    reloaded_items = []
-
-    for path in (BACKEND_ENV_PATH, ENV_FILE_PATH):
-        if os.path.exists(path):
-            load_dotenv(dotenv_path=path, override=True)
-            reloaded_items.append(f"env ({os.path.basename(path)})")
-
-    from app.agent.langgraph_agent import tool_monitor
-
-    tool_monitor.policies = tool_monitor.load_policies()
-    reloaded_items.append("policies.json")
-
-    from app.agent.model_factory import _PROVIDER_KEY_CYCLERS
-
-    _PROVIDER_KEY_CYCLERS.clear()
-    reloaded_items.append("models.json & API key pools")
-
-    broadcaster.publish_sync(
-        "analytics_updated", {"analytics": get_analytics_payload(db=next(get_db()))}
-    )
-
-    print(f"🔄 [Agent Shield] Hot-Reloaded configurations: {', '.join(reloaded_items)}")
-    return {
-        "status": "success",
-        "reloaded": reloaded_items,
-        "timestamp": os.path.getmtime(BACKEND_ENV_PATH)
-        if os.path.exists(BACKEND_ENV_PATH)
-        else None,
-    }
-
-
+# --------------------------------------------------------------------------- serialisation
 def serialize_log(log: Any) -> dict[str, Any]:
     return {
         "id": int(log.id),
-        "thread_id": str(getattr(log, "thread_id", "default_session")),
-        "timestamp": (
-            log.timestamp.isoformat()
-            if hasattr(log, "timestamp") and log.timestamp
-            else None
-        ),
+        "thread_id": str(log.thread_id or "default_session"),
+        "user_id": log.user_id,
+        "role": log.role,
+        "timestamp": log.timestamp.isoformat() if log.timestamp else None,
         "prompt": str(log.prompt),
         "risk_score": float(log.risk_score),
         "decision": str(log.decision),
@@ -148,174 +100,191 @@ def serialize_log(log: Any) -> dict[str, Any]:
         "tool_calls_attempted": log.tool_calls_attempted or [],
         "final_response": str(log.final_response) if log.final_response else None,
         "status": str(log.status),
+        "latency_ms": log.latency_ms,
     }
+
+
+def _scope(query: Any, principal: Principal) -> Any:
+    """Non-admins only ever see their own records."""
+    if principal.is_admin:
+        return query
+    return query.filter(SecurityAuditLog.user_id == principal.user)
 
 
 def get_pending_approvals_list(db: Session) -> list[dict[str, Any]]:
-    logs: list[Any] = (
+    logs = (
         db.query(SecurityAuditLog)
         .filter(SecurityAuditLog.status == "PENDING_REVIEW")
+        .order_by(SecurityAuditLog.id.asc())
+        .limit(200)
         .all()
     )
-    return [serialize_log(l) for l in logs]
+    return [serialize_log(entry) for entry in logs]
 
 
-def get_analytics_payload(db: Session) -> dict[str, Any]:
-    logs: list[Any] = db.query(SecurityAuditLog).all()
-    total = len(logs)
-    counts: dict[str, int] = {"ALLOW": 0, "WARN": 0, "APPROVE": 0, "BLOCK": 0}
+def get_analytics_payload(db: Session, user: str | None = None) -> dict[str, Any]:
+    query = db.query(SecurityAuditLog)
+    if user is not None:
+        query = query.filter(SecurityAuditLog.user_id == user)
+    logs = query.all()
+    counts = {"ALLOW": 0, "WARN": 0, "APPROVE": 0, "BLOCK": 0}
     for item in logs:
         key = str(item.decision)
         counts[key] = counts.get(key, 0) + 1
-    recent = logs[-10:] if total > 10 else logs
     return {
-        "total_requests": total,
+        "total_requests": len(logs),
         "breakdown": counts,
-        "recent_logs": [serialize_log(l) for l in recent],
+        "recent_logs": [serialize_log(item) for item in logs[-10:]],
     }
 
 
+def _push_state(db: Session) -> None:
+    """Notify admin dashboards that approvals/analytics changed ."""
+    broadcaster.publish_sync(
+        "analytics_updated", {"analytics": get_analytics_payload(db)}, admin_only=True
+    )
+    broadcaster.publish_sync(
+        "approvals_updated", {"approvals": get_pending_approvals_list(db)}, admin_only=True
+    )
+
+
+def reload_all_system_configs() -> dict[str, Any]:
+    """Reloads .env, policies.json and resets key pools at runtime."""
+    reloaded = []
+    for path in (BACKEND_ENV_PATH, ENV_FILE_PATH):
+        if os.path.exists(path):
+            load_dotenv(dotenv_path=path, override=True)
+            reloaded.append(f"env ({os.path.basename(path)})")
+
+    tool_monitor.load_policies()
+    reloaded.append("policies.json")
+    response_scanner.refresh_known_secrets()
+
+    from app.agent.model_factory import _PROVIDER_KEY_CYCLERS
+
+    _PROVIDER_KEY_CYCLERS.clear()
+    reloaded.append("models.json & API key pools")
+
+    with SessionLocal() as db:
+        _push_state(db)
+    logger.info("Hot-reloaded configurations: %s", ", ".join(reloaded))
+    return {"status": "success", "reloaded": reloaded}
+
+
+# --------------------------------------------------------------------------- SSE
 @app.get("/api/events/stream")
 async def event_stream(request: Request) -> StreamingResponse:
-    """Persistent Server-Sent Events stream for zero-polling real-time updates."""
+    """Server-Sent Events. Production: pass the key as X-API-Key or ?api_key= (EventSource
+    cannot set headers). Admins receive everything; others only events for their own chats."""
+    principal = authenticate(request, allow_query_key=True)
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        queue = await broadcaster.subscribe()
+        sub = await broadcaster.subscribe(principal.user, principal.is_admin)
         try:
             while True:
                 if await request.is_disconnected():
                     break
                 try:
-                    event_type, payload = await asyncio.wait_for(
-                        queue.get(), timeout=15.0
-                    )
-                    yield f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+                    event_type, payload = await asyncio.wait_for(sub.queue.get(), timeout=15.0)
+                    yield f"event: {event_type}\ndata: {json.dumps(payload, default=str)}\n\n"
                 except TimeoutError:
                     yield ": keep-alive\n\n"
         finally:
-            broadcaster.unsubscribe(queue)
+            broadcaster.unsubscribe(sub)
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
-
-
-def resolve_authenticated_context(
-    request: Request, req: ChatRequest
-) -> tuple[str, str]:
-    """Dual-Mode Authenticator (Development Permissive vs. Production Zero-Trust)."""
-    client_interface = request.headers.get("X-Client-Interface", "web").lower()
-
-    if get_security_env() == "development":
-        effective_role = req.role or "Standard Users"
-        return effective_role, client_interface
-
-    api_key = request.headers.get("X-API-Key", "").strip()
-    if not api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Production mode requires a valid X-API-Key header.",
-        )
-
-    registry = load_user_registry()
-    user_data = registry.get("api_keys", {}).get(api_key)
-
-    if not user_data or not user_data.get("enabled", False):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or revoked API Key.",
-        )
-
-    allowed_interfaces = user_data.get("allowed_interfaces", ["web"])
-    if client_interface not in allowed_interfaces:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"User '{user_data.get('user')}' is not authorized to access "
-                f"via '{client_interface}'. Allowed interfaces: {allowed_interfaces}."
-            ),
-        )
-
-    server_bound_role = user_data.get("role", "Standard Users")
-    return server_bound_role, client_interface
 
 
 @app.get("/api/auth/verify")
 def verify_auth(request: Request) -> dict[str, Any]:
-    """Pre-flight handshake for CLI and Web clients to verify credentials."""
-    client_interface = request.headers.get("X-Client-Interface", "web").lower()
-
-    if get_security_env() == "development":
-        return {"status": "ok", "mode": "development", "role": "Unbound (Dev Mode)"}
-
-    api_key = request.headers.get("X-API-Key", "").strip()
-    if not api_key:
-        # Return 200 with mode so the UI knows to switch to production mode without crashing
-        return {
-            "status": "unauthenticated",
-            "mode": "production",
-            "role": "Standard Users",
-            "authenticated": False,
-        }
-
-    registry = load_user_registry()
-    user_data = registry.get("api_keys", {}).get(api_key)
-    if not user_data or not user_data.get("enabled", False):
-        raise HTTPException(status_code=401, detail="Invalid or revoked API Key.")
-
-    allowed_interfaces = user_data.get("allowed_interfaces", ["web"])
-    if client_interface not in allowed_interfaces:
-        raise HTTPException(
-            status_code=403,
-            detail=f"User '{user_data.get('user')}' is restricted to interfaces: {allowed_interfaces}.",
-        )
-
+    """Pre-flight handshake for CLI and Web clients."""
+    if is_development():
+        return {"status": "ok", "mode": "development", "role": "Unbound (Dev Mode)", "is_admin": True}
+    if not request.headers.get("X-API-Key", "").strip():
+        return {"status": "unauthenticated", "mode": "production", "role": "Standard Users", "authenticated": False}
+    p = authenticate(request)
     return {
         "status": "ok",
         "mode": "production",
-        "role": user_data.get("role", "Standard Users"),
-        "user": user_data.get("user"),
+        "role": p.role,
+        "user": p.user,
+        "is_admin": p.is_admin,
         "authenticated": True,
     }
 
 
+# --------------------------------------------------------------------------- chat
+def _tool_calls_from_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for msg in messages:
+        calls.extend(getattr(msg, "tool_calls", None) or [])
+    return calls
+
+
 @app.post("/api/chat", response_model=ChatResponse)
-def handle_chat_request(
-    request: Request,
-    req: ChatRequest,
-    db: Annotated[Session, Depends(get_db)],
-) -> ChatResponse:
-    # 1. Resolve Identity, Effective Role & Interface
-    effective_role, client_interface = resolve_authenticated_context(request, req)
+def handle_chat_request(request: Request, req: ChatRequest, db: DbSession, principal: User) -> ChatResponse:
+    t_start = time.perf_counter()
 
-    # 2. Resolve Session Thread ID
-    thread_id = req.thread_id or "default_session"
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    # 1. Identity (production: server-bound; development: client-declared)
+    if is_development():
+        effective_role = req.role or "Standard Users"
+        user_id = req.user_id or "default_user"
+    else:
+        effective_role, user_id = principal.role, principal.user
+    client_interface = principal.interface
 
-    # 3. Prepare execution prompt with attachment context if present
+    # 2. Thread ownership: a caller may not write into someone else's session
+    thread_id = req.thread_id or f"session_{uuid.uuid4().hex[:16]}"
+    owner = (
+        db.query(SecurityAuditLog.user_id)
+        .filter(SecurityAuditLog.thread_id == thread_id)
+        .order_by(SecurityAuditLog.id.asc())
+        .first()
+    )
+    if owner and owner[0] and owner[0] != user_id and not principal.is_admin:
+        raise HTTPException(403, "This session belongs to another user.")
+
+    # 3. Build the model-facing prompt. Attachments / RAG are UNTRUSTED data, delimited as such.
+    untrusted_parts: list[str] = []
     execution_prompt = req.prompt
     if req.attachment and req.attachment.get("content"):
-        att_name = req.attachment.get("name", "attachment")
-        att_content = req.attachment.get("content")
-        execution_prompt = (
-            f"{req.prompt}\n\n--- Attached File ({att_name}) ---\n{att_content}"
+        att_name = str(req.attachment.get("name", "attachment"))[:120]
+        att_content = str(req.attachment["content"])
+        untrusted_parts.append(att_content)
+        execution_prompt += (
+            f'\n\n<untrusted_attachment name="{att_name}">\n'
+            f'{att_content.replace("</untrusted_attachment", "</untrusted_attachment_")}\n</untrusted_attachment>'
         )
+    if req.rag_context:
+        untrusted_parts.append(req.rag_context)
+        execution_prompt += (
+            "\n\n<untrusted_attachment name=\"retrieved_context\">\n"
+            f'{req.rag_context.replace("</untrusted_attachment", "</untrusted_attachment_")}\n</untrusted_attachment>'
+        )
+    untrusted_text = "\n\n".join(untrusted_parts) or None
 
-    # 4. Inbound Layer 1 Security Scan
-    p_res = prompt_scanner.scan(execution_prompt, req.rag_context)
-    j_res = jailbreak_detector.scan(execution_prompt)
-    inbound_score, decision, justification = RiskEngine.aggregate_and_decide(
-        p_res, j_res
-    )
+    # 4. Inbound Layer 1
+    timings: dict[str, float] = {}
+    t = time.perf_counter()
+    p_res = prompt_scanner.scan(req.prompt, untrusted_text)
+    timings["prompt_scanner"] = round((time.perf_counter() - t) * 1000, 2)
+    t = time.perf_counter()
+    j_res = jailbreak_detector.scan(req.prompt)
+    if untrusted_text:
+        j_ctx = jailbreak_detector.scan(untrusted_text)
+        if j_ctx["score"] > j_res["score"]:
+            j_res = {**j_ctx, "reason": f"(in attached/retrieved content) {j_ctx['reason']}"}
+    timings["jailbreak_detector"] = round((time.perf_counter() - t) * 1000, 2)
+    inbound_score, decision, justification = RiskEngine.aggregate_and_decide(p_res, j_res)
 
-    audit_entry: Any = SecurityAuditLog(
+    audit = SecurityAuditLog(
         thread_id=thread_id,
+        user_id=user_id,
+        role=effective_role,
         prompt=req.prompt,
         risk_score=inbound_score,
         decision=decision,
@@ -325,47 +294,59 @@ def handle_chat_request(
         status="COMPLETED",
     )
 
-    def broadcast_chat_update(reply_text: str, replies: list[str]) -> None:
+    def persist() -> None:
+        timings["total"] = round((time.perf_counter() - t_start) * 1000, 2)
+        audit.triggered_detectors = {
+            **(audit.triggered_detectors or {}),
+            "timings_ms": timings,
+        }
+        audit.latency_ms = timings["total"]
+        db.add(audit)
+        db.commit()
+        db.refresh(audit)
+
+    def broadcast(reply_text: str, replies: list[str]) -> None:
         broadcaster.publish_sync(
             "chat_message",
             {
                 "session_id": thread_id,
                 "client_interface": client_interface,
-                "log_id": int(audit_entry.id),
+                "log_id": int(audit.id),
                 "prompt": req.prompt,
                 "attachment": req.attachment,
                 "reply": reply_text,
                 "replies": replies,
-                "decision": str(audit_entry.decision),
-                "risk_score": float(audit_entry.risk_score),
-                "justification": str(audit_entry.justification),
-                "tool_calls": audit_entry.tool_calls_attempted or [],
-                "approval_needed": bool(audit_entry.status == "PENDING_REVIEW"),
+                "decision": str(audit.decision),
+                "risk_score": float(audit.risk_score),
+                "justification": str(audit.justification),
+                "tool_calls": audit.tool_calls_attempted or [],
+                "approval_needed": audit.status == "PENDING_REVIEW",
             },
+            owner=user_id,
         )
 
-    if decision == "BLOCK":
-        block_msg = "[SECURITY BLOCK]: Action aborted by Agent Shield. Direct prompt injection or adversarial phrasing identified."
-        audit_entry.final_response = block_msg
-        db.add(audit_entry)
-        db.commit()
-        db.refresh(audit_entry)
-
-        broadcast_chat_update(block_msg, [block_msg])
-        broadcaster.publish_sync(
-            "analytics_updated", {"analytics": get_analytics_payload(db)}
-        )
-
+    def respond(reply: str, replies: list[str] | None = None, approval: bool = False) -> ChatResponse:
+        persist()
+        replies = replies or [reply]
+        broadcast(reply, replies)
+        _push_state(db)
         return ChatResponse(
-            log_id=int(audit_entry.id),
-            decision="BLOCK",
-            risk_score=inbound_score,
-            justification=justification,
-            reply=block_msg,
-            replies=[block_msg],
-            approval_needed=False,
+            log_id=int(audit.id),
+            decision=str(audit.decision),
+            risk_score=float(audit.risk_score),
+            justification=str(audit.justification),
+            reply=reply,
+            replies=replies,
+            approval_needed=approval,
         )
 
+    # 5. Hard stop before the model is ever called
+    if decision == "BLOCK":
+        msg = "[SECURITY BLOCK]: Action aborted by Agent Shield. Prompt injection or adversarial phrasing identified."
+        audit.final_response = msg
+        return respond(msg)
+
+    # 6. Run the agent (Layers 2 & 3 live inside the graph)
     initial_state: AgentState = {
         "messages": [HumanMessage(content=execution_prompt)],
         "status": "RUNNING",
@@ -381,152 +362,66 @@ def handle_chat_request(
         "escalate": decision == "APPROVE",
         "notes": [],
     }
-
+    t = time.perf_counter()
     try:
-        final_state: dict[str, Any] = compiled_agent.invoke(
-            cast(Any, initial_state), config=config
-        )
+        final_state: dict[str, Any] = compiled_agent.invoke(initial_state)
     except Exception as e:  # noqa: BLE001
-        err_msg = str(e)
-        audit_entry.decision = "WARN"
-        audit_entry.risk_score = 45.0
-        audit_entry.justification = f"Inference Error: {err_msg[:120]}"
-        audit_entry.final_response = f"Execution limitation: {err_msg[:200]}"
-        db.add(audit_entry)
-        db.commit()
-        db.refresh(audit_entry)
+        logger.exception("Agent invocation failed")
+        timings["agent"] = round((time.perf_counter() - t) * 1000, 2)
+        audit.decision = "WARN"
+        audit.risk_score = max(inbound_score, 45.0)
+        audit.justification = "Upstream model/provider error; request not completed."
+        audit.final_response = "The model provider returned an error. Please try again."
+        # Details stay in the server log, not in the user-visible response.
+        audit.triggered_detectors = {**audit.triggered_detectors, "error": str(e)[:300]}
+        return respond(f"[Agent Shield Alert]: {audit.final_response}")
+    timings["agent"] = round((time.perf_counter() - t) * 1000, 2)
 
-        broadcast_chat_update(audit_entry.final_response, [audit_entry.final_response])
-        return ChatResponse(
-            log_id=int(audit_entry.id),
-            decision="WARN",
-            risk_score=45.0,
-            justification="Upstream engine limit.",
-            reply=f"[Agent Shield Alert]: {err_msg[:200]}",
-            replies=[f"[Agent Shield Alert]: {err_msg[:200]}"],
-            approval_needed=False,
-        )
-
-    # 1. CHECK: Did LangGraph tool inspection block the action?
-    notes = final_state.get("notes") or []
+    status = final_state.get("status")
+    worst = str(final_state.get("worst_action", decision))
+    notes: list[str] = final_state.get("notes", [])
     full_justification = justification + (" | " + " | ".join(notes) if notes else "")
+    risk = float(final_state.get("risk_score", inbound_score))
 
-    if final_state.get("status") == "BLOCKED":
-        audit_entry.decision = "BLOCK"
-        audit_entry.risk_score = float(final_state.get("risk_score", 85.0))
-        audit_entry.justification = full_justification
-        audit_entry.final_response = (
-            final_state.get("final_output")
-            or f"[SECURITY FIREWALL]: Execution blocked by policy for role '{effective_role}'."
-        )
-        audit_entry.status = "COMPLETED"
-        audit_entry.tool_calls_attempted = list(
-            getattr(final_state["messages"][-1], "tool_calls", None) or []
-        )
-        db.add(audit_entry)
-        db.commit()
-        db.refresh(audit_entry)
+    if status == "BLOCKED":
+        audit.decision, audit.risk_score = "BLOCK", max(risk, inbound_score)
+        audit.justification = full_justification
+        audit.final_response = final_state.get("final_output") or "[SECURITY FIREWALL]: Execution blocked by policy."
+        audit.tool_calls_attempted = _tool_calls_from_messages(final_state.get("messages", [])[-1:])
+        return respond(audit.final_response)
 
-        broadcast_chat_update(audit_entry.final_response, [audit_entry.final_response])
-        broadcaster.publish_sync(
-            "analytics_updated", {"analytics": get_analytics_payload(db)}
-        )
-
-        return ChatResponse(
-            log_id=int(audit_entry.id),
-            decision="BLOCK",
-            risk_score=audit_entry.risk_score,
-            justification=audit_entry.justification,
-            reply=audit_entry.final_response,
-            replies=[audit_entry.final_response],
-            approval_needed=False,
-        )
-
-    # 2. CHECK: Did LangGraph pause for human approval?
-    if final_state.get("status") == "WAITING_APPROVAL":
+    if status == "WAITING_APPROVAL":
         pending = final_state.get("pending_tool_calls") or []
-        tool_name = ", ".join(c.get("name", "unknown_tool") for c in pending)
-
-        audit_entry.decision = "APPROVE"
-        audit_entry.risk_score = float(final_state.get("risk_score", 55.0))
-        audit_entry.justification = full_justification
-        audit_entry.status = "PENDING_REVIEW"
-        audit_entry.tool_calls_attempted = pending
-        hold_msg = (
-            f"⏸️ **[SECURITY HOLD]**: The agent attempted to execute privileged tool `{tool_name}`. "
-            f"This action has been suspended and queued in the **Human Review Queue** for confirmation."
+        names = ", ".join(c.get("name", "tool") for c in pending) or "tool"
+        audit.decision, audit.risk_score = "APPROVE", max(risk, inbound_score)
+        audit.justification = full_justification
+        audit.status = "PENDING_REVIEW"
+        audit.tool_calls_attempted = pending
+        hold = (
+            f"⏸️ **[SECURITY HOLD]**: The agent attempted to execute privileged tool(s) `{names}`. "
+            "This action has been suspended and queued in the **Human Review Queue** for confirmation."
         )
-        audit_entry.final_response = hold_msg
+        audit.final_response = hold
+        return respond(hold, approval=True)
 
-        db.add(audit_entry)
-        db.commit()
-        db.refresh(audit_entry)
+    # Normal completion (decision = worst severity observed anywhere in the pipeline)
+    audit.decision = worst
+    audit.risk_score = max(inbound_score, risk)
+    audit.justification = full_justification
+    raw_final = str(final_state.get("final_output") or "Task completed.")
+    audit.final_response = raw_final
+    audit.tool_calls_attempted = _tool_calls_from_messages(final_state.get("messages", []))
 
-        broadcaster.publish_sync(
-            "approvals_updated", {"approvals": get_pending_approvals_list(db)}
-        )
-        broadcaster.publish_sync(
-            "analytics_updated", {"analytics": get_analytics_payload(db)}
-        )
-        broadcast_chat_update(hold_msg, [hold_msg])
-
-        return ChatResponse(
-            log_id=int(audit_entry.id),
-            decision="APPROVE",
-            risk_score=float(audit_entry.risk_score),
-            justification=str(audit_entry.justification),
-            reply=hold_msg,
-            replies=[hold_msg],
-            approval_needed=True,
-        )
-
-    # Normal Completion
-    audit_entry.decision = str(final_state.get("worst_action", decision))
-    audit_entry.risk_score = max(
-        inbound_score, float(final_state.get("risk_score", 0.0))
-    )
-    audit_entry.justification = full_justification
-
-    raw_final: str = str(final_state.get("final_output") or "Task completed.")
-    audit_entry.final_response = raw_final
-
-    executed_tools = []
-    for msg in final_state.get("messages", []):
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            executed_tools.extend(msg.tool_calls)
-    audit_entry.tool_calls_attempted = executed_tools
-
-    db.add(audit_entry)
-    db.commit()
-    db.refresh(audit_entry)
-
-    split_chunks = re.split(
-        r"(?:---|###|\n\n)\s*(?:Response|Message)\s*\d+\s*(?:---|:)?\s*", raw_final
-    )
-    cleaned_replies = [c.strip() for c in split_chunks if c.strip()]
-    final_replies = cleaned_replies if len(cleaned_replies) > 1 else [raw_final]
-
-    broadcast_chat_update(raw_final, final_replies)
-    broadcaster.publish_sync(
-        "analytics_updated", {"analytics": get_analytics_payload(db)}
-    )
-
-    return ChatResponse(
-        log_id=int(audit_entry.id),
-        decision=str(audit_entry.decision),
-        risk_score=float(audit_entry.risk_score),
-        justification=str(audit_entry.justification),
-        reply=raw_final,
-        replies=final_replies,
-        approval_needed=False,
-    )
+    chunks = re.split(r"(?:---|###|\n\n)\s*(?:Response|Message)\s*\d+\s*(?:---|:)?\s*", raw_final)
+    cleaned = [c.strip() for c in chunks if c.strip()]
+    return respond(raw_final, cleaned if len(cleaned) > 1 else [raw_final])
 
 
+# --------------------------------------------------------------------------- models/providers
 @app.get("/api/providers")
-def list_providers() -> list[dict[str, Any]]:
+def list_providers(_: Admin) -> list[dict[str, Any]]:
     from app.agent.model_factory import load_model_registry
 
-    providers = load_model_registry()
     return [
         {
             "id": p.get("id"),
@@ -535,7 +430,7 @@ def list_providers() -> list[dict[str, Any]]:
             "model": p.get("model"),
             "keys_configured": len(p.get("resolved_keys", [])),
         }
-        for p in providers
+        for p in load_model_registry()
     ]
 
 
@@ -546,63 +441,60 @@ def get_available_models() -> list[dict[str, Any]]:
     return get_available_models_for_ui()
 
 
+# --------------------------------------------------------------------------- approvals
 @app.get("/api/approvals/pending")
-def list_pending_approvals(
-    db: Annotated[Session, Depends(get_db)],
-    response: Response,
-) -> list[dict[str, Any]]:
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
+def list_pending_approvals(db: DbSession, response: Response, _: Admin) -> list[dict[str, Any]]:
+    response.headers["Cache-Control"] = "no-store"
     return get_pending_approvals_list(db)
 
 
 @app.post("/api/approvals/resolve")
-def resolve_approval(
-    req: ResolveApprovalRequest, db: Annotated[Session, Depends(get_db)]
-) -> dict[str, Any]:
-    log: Any = (
-        db.query(SecurityAuditLog).filter(SecurityAuditLog.id == req.log_id).first()
-    )
+def resolve_approval(req: ResolveApprovalRequest, db: DbSession, admin: Admin) -> dict[str, Any]:
+    log = db.query(SecurityAuditLog).filter(SecurityAuditLog.id == req.log_id).first()
     if not log:
-        raise HTTPException(status_code=404, detail="Log entry not found")
+        raise HTTPException(404, "Log entry not found")
 
+    # Atomic claim: only one resolver can move PENDING_REVIEW -> APPROVED/REJECTED, so a tool
+    # call can never be executed twice by double-clicks or replayed requests.
+    new_status = "APPROVED" if req.action == "APPROVE" else "REJECTED"
+    claimed = db.execute(
+        update(SecurityAuditLog)
+        .where(SecurityAuditLog.id == req.log_id, SecurityAuditLog.status == "PENDING_REVIEW")
+        .values(status=new_status, resolved_by=admin.user)
+    )
+    db.commit()
+    if claimed.rowcount != 1:
+        raise HTTPException(409, "This request is not awaiting review (already resolved?).")
+    db.refresh(log)
+
+    tool_calls = log.tool_calls_attempted or []
     if req.action == "APPROVE":
-        log.status = "APPROVED"
-        tool_calls = log.tool_calls_attempted or []
         outputs: list[str] = []
-        for tool_call in tool_calls:  # a held turn may contain several calls: run them all
-            if tool_call.get("name") not in TOOLS_BY_NAME:
+        for call in tool_calls:
+            name = call.get("name", "")
+            # Re-check at execution time: policy may have changed since the hold.
+            recheck = tool_monitor.inspect(
+                name, call.get("args") or {}, log.thread_id, log.role or "Standard Users", set(TOOLS_BY_NAME)
+            )
+            if recheck["action"] == "BLOCK":
+                outputs.append(f"`{name}` refused at execution time: {'; '.join(recheck['reasons'])}")
                 continue
             try:
-                raw_result = TOOLS_BY_NAME[tool_call["name"]].invoke(tool_call.get("args", {}))
-                sanitized = response_scanner.scan(str(raw_result))["sanitized_response"]
-                outputs.append(f"```\n{sanitized}\n```")
-            except (RuntimeError, ValueError, OSError) as e:
+                tool_monitor.record_invocation(log.thread_id, name)
+                raw = TOOLS_BY_NAME[name].invoke(call.get("args") or {})
+                outputs.append(f"```\n{response_scanner.scan(str(raw))['sanitized_response']}\n```")
+            except Exception as e:  # noqa: BLE001
                 outputs.append(f"Execution error: {e!s}")
-
         names = ", ".join(c.get("name", "tool") for c in tool_calls) or "tool"
         log.final_response = "\n".join(outputs) or f"Tool `{names}` completed."
         decision_label = "AUTHORIZED"
     else:
-        log.status = "REJECTED"
-        tool_name = (
-            log.tool_calls_attempted[0].get("name")
-            if log.tool_calls_attempted
-            else "tool"
-        )
-        log.final_response = f"Execution of `{tool_name}` was cancelled."
+        names = ", ".join(c.get("name", "tool") for c in tool_calls) or "tool"
+        log.final_response = f"Execution of `{names}` was cancelled."
         decision_label = "REJECTED"
-
     db.commit()
 
-    broadcaster.publish_sync(
-        "approvals_updated", {"approvals": get_pending_approvals_list(db)}
-    )
-    broadcaster.publish_sync(
-        "analytics_updated", {"analytics": get_analytics_payload(db)}
-    )
-
+    _push_state(db)
     return {
         "status": "success",
         "log_id": log.id,
@@ -612,33 +504,11 @@ def resolve_approval(
     }
 
 
-@app.get("/api/logs")
-def get_logs_by_decision(
-    db: Annotated[Session, Depends(get_db)],
-    decision: str | None = None,
-) -> list[dict[str, Any]]:
-    query = db.query(SecurityAuditLog)
-    if decision:
-        query = query.filter(SecurityAuditLog.decision == decision.upper())
-    logs: list[Any] = query.order_by(SecurityAuditLog.id.desc()).limit(50).all()
-    return [serialize_log(l) for l in logs]
-
-
-@app.get("/api/analytics")
-def get_analytics(db: Annotated[Session, Depends(get_db)]) -> dict[str, Any]:
-    return get_analytics_payload(db)
-
-
 @app.post("/api/session/grant-lease")
-def grant_lease(req: GrantLeaseRequest) -> dict[str, Any]:
-    from app.agent.langgraph_agent import tool_monitor
-
-    tool_monitor.grant_session_lease(
-        thread_id=req.thread_id,
-        tool_name=req.tool_name,
-        max_uses=req.max_uses,
-        duration_seconds=req.duration_seconds,
-    )
+def grant_lease(req: GrantLeaseRequest, _: Admin) -> dict[str, Any]:
+    if req.tool_name not in TOOLS_BY_NAME:
+        raise HTTPException(400, f"Unknown tool '{req.tool_name}'.")
+    tool_monitor.grant_session_lease(req.thread_id, req.tool_name, req.max_uses, req.duration_seconds)
     return {
         "status": "success",
         "message": (
@@ -648,91 +518,84 @@ def grant_lease(req: GrantLeaseRequest) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- audit & analytics
+@app.get("/api/logs")
+def get_logs_by_decision(db: DbSession, principal: User, decision: str | None = None) -> list[dict[str, Any]]:
+    query = _scope(db.query(SecurityAuditLog), principal)
+    if decision:
+        query = query.filter(SecurityAuditLog.decision == decision.upper())
+    return [serialize_log(r) for r in query.order_by(SecurityAuditLog.id.desc()).limit(50).all()]
+
+
+@app.get("/api/analytics")
+def get_analytics(db: DbSession, principal: User) -> dict[str, Any]:
+    return get_analytics_payload(db, None if principal.is_admin else principal.user)
+
+
 @app.get("/api/sessions")
-def get_all_sessions(db: Annotated[Session, Depends(get_db)]) -> list[dict[str, Any]]:
-    logs: list[Any] = (
-        db.query(SecurityAuditLog).order_by(SecurityAuditLog.id.desc()).all()
-    )
-    seen = set()
+def get_all_sessions(db: DbSession, principal: User) -> list[dict[str, Any]]:
+    logs = _scope(db.query(SecurityAuditLog), principal).order_by(SecurityAuditLog.id.desc()).all()
+    seen: set[str] = set()
     sessions = []
-    for l in logs:
-        t_id = getattr(l, "thread_id", "default_session")
-        if t_id and t_id not in seen:
-            seen.add(t_id)
-            timestamp_val = getattr(l, "timestamp", None)
+    for r in logs:
+        if r.thread_id and r.thread_id not in seen:
+            seen.add(r.thread_id)
             sessions.append(
                 {
-                    "id": t_id,
-                    "title": (
-                        f"CLI: {l.prompt[:22]}..."
-                        if t_id.startswith("cli_")
-                        else (l.prompt[:24] + "...")
-                    ),
-                    "latest_activity": (
-                        timestamp_val.isoformat() if timestamp_val else None
-                    ),
+                    "id": r.thread_id,
+                    "title": (f"CLI: {r.prompt[:22]}..." if str(r.thread_id).startswith("cli_") else r.prompt[:24] + "..."),
+                    "latest_activity": r.timestamp.isoformat() if r.timestamp else None,
                 }
             )
     return sessions
 
 
 @app.get("/api/sessions/{thread_id}/messages")
-def get_session_messages(
-    thread_id: str, db: Annotated[Session, Depends(get_db)]
-) -> list[dict[str, Any]]:
-    logs: list[Any] = (
-        db.query(SecurityAuditLog)
+def get_session_messages(thread_id: str, db: DbSession, principal: User) -> list[dict[str, Any]]:
+    logs = (
+        _scope(db.query(SecurityAuditLog), principal)
         .filter(SecurityAuditLog.thread_id == thread_id)
         .order_by(SecurityAuditLog.id.asc())
+        .limit(500)
         .all()
     )
-    result = []
-    for l in logs:
-        timestamp_val = getattr(l, "timestamp", None)
-        ts_str = timestamp_val.strftime("%I:%M %p") if timestamp_val else ""
-        result.append(
-            {
-                "role": "user",
-                "content": l.prompt,
-                "timestamp": ts_str,
-            }
-        )
+    result: list[dict[str, Any]] = []
+    for entry in logs:
+        ts = entry.timestamp.strftime("%I:%M %p") if entry.timestamp else ""
+        result.append({"role": "user", "content": entry.prompt, "timestamp": ts})
         result.append(
             {
                 "role": "agent",
-                "content": l.final_response or "",
-                "decision": l.decision,
-                "risk": l.risk_score,
-                "justification": l.justification,
-                "logId": l.id,
-                "toolCalls": l.tool_calls_attempted or [],
-                "approvalNeeded": l.status == "PENDING_REVIEW",
-                "timestamp": ts_str,
+                "content": entry.final_response or "",
+                "decision": entry.decision,
+                "risk": entry.risk_score,
+                "justification": entry.justification,
+                "logId": entry.id,
+                "toolCalls": entry.tool_calls_attempted or [],
+                "approvalNeeded": entry.status == "PENDING_REVIEW",
+                "timestamp": ts,
             }
         )
     return result
 
 
 @app.post("/api/config/reload")
-def trigger_config_reload() -> dict[str, Any]:
+def trigger_config_reload(_: Admin) -> dict[str, Any]:
     return reload_all_system_configs()
 
 
-# Static Frontend SPA Serving MUST BE AT THE VERY BOTTOM (so it doesn't shadow /api routes)
+# Static SPA serving MUST stay last so it does not shadow /api routes.
 if os.path.exists(FRONTEND_DIST):
+    _dist_real = os.path.realpath(FRONTEND_DIST)
     assets_dir = os.path.join(FRONTEND_DIST, "assets")
     if os.path.exists(assets_dir):
-        app.mount(
-            "/assets",
-            StaticFiles(directory=assets_dir),
-            name="assets",
-        )
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
     @app.get("/{full_path:path}")
     def serve_frontend_spa(full_path: str) -> FileResponse:
         if full_path.startswith("api/"):
-            raise HTTPException(status_code=404, detail="API endpoint not found")
-        direct_file = os.path.join(FRONTEND_DIST, full_path)
-        if full_path and os.path.isfile(direct_file):
-            return FileResponse(direct_file)
-        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+            raise HTTPException(404, "API endpoint not found")
+        candidate = os.path.realpath(os.path.join(_dist_real, full_path))
+        if full_path and os.path.commonpath([candidate, _dist_real]) == _dist_real and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        return FileResponse(os.path.join(_dist_real, "index.html"))

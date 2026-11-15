@@ -94,6 +94,9 @@ def shield_interceptor_node(state: AgentState):
         tool_call["name"], tool_call["args"], thread_id=t_id, role=user_role
     )
 
+    if inspection.get("uses_lease"):
+        tool_monitor.consume_lease(t_id, tool_call["name"])  # the lease is spent only when it lets a call run
+
     risk_score = inspection["score"]
     reasons = " | ".join(inspection["reasons"])
     if risk_score > 80:
@@ -128,6 +131,7 @@ def tool_execution_node(state: AgentState):
     if not tool_obj:
         tool_output = f"Tool '{tool_call['name']}' not registered."
     else:
+        tool_monitor.record_invocation(state.get("thread_id"), tool_call["name"])
         try:
             tool_output = tool_obj.invoke(tool_call["args"])
         except Exception as e:  # noqa: BLE001

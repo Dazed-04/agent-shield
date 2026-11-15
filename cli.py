@@ -39,7 +39,7 @@ try:
 except ImportError:
     RICH_AVAILABLE = False
 
-GATEWAY_URL = "http://localhost:8000/api"
+GATEWAY_URL = os.getenv("AGENT_SHIELD_URL", "http://localhost:8000").rstrip("/") + "/api"
 SESSION_ID = f"cli_{uuid.uuid4().hex[:8]}"
 HISTORY_FILE = os.path.expanduser("~/.agent_shield_history")
 SANDBOX_DIR = os.path.abspath("./sandbox")
@@ -57,6 +57,22 @@ cli_args, _ = parser.parse_known_args()
 CURRENT_ROLE = "Domain Admins" if cli_args.admin else cli_args.role
 API_KEY = cli_args.key or os.getenv("AGENT_SHIELD_KEY", "")
 SERVER_MODE = "development"
+
+
+def auth_headers() -> dict[str, str]:
+    """Headers every gateway call needs (the admin endpoints are authenticated too)."""
+    return {"X-Client-Interface": "cli", "X-API-Key": API_KEY}
+
+
+def _api_error(res: "requests.Response") -> str | None:
+    """Human-readable message if the gateway rejected the call, else None."""
+    if res.status_code < 400:
+        return None
+    try:
+        detail = res.json().get("detail", res.text)
+    except ValueError:
+        detail = res.text
+    return f"HTTP {res.status_code}: {detail}"
 
 
 def preflight_auth_check() -> None:
@@ -286,7 +302,11 @@ def load_file_attachment(file_path: str) -> dict[str, Any] | None:
 
 def handle_pending_approvals() -> None:
     try:
-        res = requests.get(f"{GATEWAY_URL}/approvals/pending", timeout=10)
+        res = requests.get(f"{GATEWAY_URL}/approvals/pending", headers=auth_headers(), timeout=10)
+        err = _api_error(res)
+        if err:
+            print(f"\033[31m[Gateway refused the request]: {err}\033[0m\n")
+            return
         items = res.json()
     except requests.RequestException as e:
         print(f"\033[31m[Network Error]: Could not reach gateway: {e}\033[0m\n")
@@ -315,8 +335,13 @@ def handle_pending_approvals() -> None:
             resolve_res = requests.post(
                 f"{GATEWAY_URL}/approvals/resolve",
                 json={"log_id": item["id"], "action": action},
+                headers=auth_headers(),
                 timeout=10,
             )
+            err = _api_error(resolve_res)
+            if err:
+                print(f"\033[31m[Resolution refused]: {err}\033[0m\n")
+                continue
             result_data = resolve_res.json()
             print(f"\033[32m✔ {result_data.get('new_response', 'Resolved')}\033[0m\n")
         except requests.RequestException as e:
@@ -388,7 +413,11 @@ def main() -> None:
 
             if raw_input_text == "/reload":
                 try:
-                    res = requests.post(f"{GATEWAY_URL}/config/reload", timeout=5)
+                    res = requests.post(f"{GATEWAY_URL}/config/reload", headers=auth_headers(), timeout=5)
+                    err = _api_error(res)
+                    if err:
+                        print(f"\033[31m❌ Reload refused: {err}\033[0m\n")
+                        continue
                     data = res.json()
                     print(
                         f"\033[32m✔ Gateway Hot-Reload Complete: {', '.join(data.get('reloaded', []))}\033[0m\n"

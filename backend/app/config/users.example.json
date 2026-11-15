@@ -1,0 +1,33 @@
+{
+  "_comment": "Copy to users.json and replace every key. Prefer 'api_key_hashes' (sha256 hex of the key) over plaintext 'api_keys'. Generate a key: python -c \"import secrets;print('shield_'+secrets.token_urlsafe(32))\" ; hash it: python -c \"import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())\" <key>",
+  "api_keys": {
+    "REPLACE_ME_ADMIN_KEY": {
+      "user": "sysadmin_lead",
+      "role": "Domain Admins",
+      "is_admin": true,
+      "allowed_interfaces": [
+        "cli",
+        "web"
+      ],
+      "enabled": true
+    },
+    "REPLACE_ME_DS_KEY": {
+      "user": "researcher_bob",
+      "role": "Data Science",
+      "allowed_interfaces": [
+        "web"
+      ],
+      "enabled": true
+    },
+    "REPLACE_ME_STANDARD_KEY": {
+      "user": "standard_user_web",
+      "role": "Standard Users",
+      "allowed_interfaces": [
+        "web",
+        "cli"
+      ],
+      "enabled": true
+    }
+  },
+  "api_key_hashes": {}
+}

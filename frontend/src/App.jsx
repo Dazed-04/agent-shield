@@ -1,3 +1,4 @@
+import ApiKeyModal from "./components/modals/ApiKeyModal";
 import { useState, useEffect, useRef } from "react";
 import axios from "axios";
 import { ShieldAlert, ShieldCheck, AlertTriangle, Ban } from "lucide-react";
@@ -12,7 +13,8 @@ import ArtifactModal from "./components/modals/ArtifactModal";
 import ApprovalModal from "./components/modals/ApprovalModal";
 import AuditModal from "./components/modals/AuditModal";
 
-const API_BASE = "http://127.0.0.1:8000/api";
+// Same-origin by default (served by FastAPI, or proxied by Vite in dev). Override with VITE_API_BASE.
+const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 
 const PRESET_PAYLOADS = [
   {
@@ -81,9 +83,15 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState("");
   const [selectedRole, setSelectedRole] = useState("Standard Users");
   const [serverMode, setServerMode] = useState("development");
-  const [webApiKey] = useState(
+  const [webApiKey, setWebApiKey] = useState(
     () => localStorage.getItem("as_web_api_key") || "",
   );
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authError, setAuthError] = useState("");
+  // Every request (including approvals / analytics / logs) carries the caller's identity.
+  axios.defaults.headers.common["X-Client-Interface"] = "web";
+  if (webApiKey) axios.defaults.headers.common["X-API-Key"] = webApiKey;
+  else delete axios.defaults.headers.common["X-API-Key"];
 
   const [prompt, setPrompt] = useState("");
   const [loading, setLoading] = useState(false);
@@ -134,32 +142,43 @@ export default function App() {
 
         if (authRes.data?.mode) {
           setServerMode(authRes.data.mode);
+          setAuthRequired(
+            authRes.data.mode === "production" && !authRes.data.authenticated,
+          );
           if (authRes.data.role && authRes.data.mode === "production")
             setSelectedRole(authRes.data.role);
         }
       } catch (e) {
         console.error(e);
+        if ([401, 403].includes(e.response?.status)) {
+          setAuthError(e.response?.data?.detail || "Invalid API key.");
+          setAuthRequired(true);
+        }
       }
     };
     fetchInitData();
   }, [webApiKey]);
 
   const fetchData = async () => {
+    // Independent calls: a non-admin may read their analytics but not the approval queue.
     try {
-      const [aRes, pRes] = await Promise.all([
-        axios.get(`${API_BASE}/analytics`),
-        axios.get(`${API_BASE}/approvals/pending`),
-      ]);
-      setAnalytics(aRes.data);
-      setPendingApprovals(pRes.data);
+      setAnalytics((await axios.get(`${API_BASE}/analytics`)).data);
     } catch (err) {
       console.error(err);
+    }
+    try {
+      setPendingApprovals((await axios.get(`${API_BASE}/approvals/pending`)).data);
+    } catch (err) {
+      if (![401, 403].includes(err.response?.status)) console.error(err);
     }
   };
 
   useEffect(() => {
     fetchData();
-    const eventSource = new EventSource(`${API_BASE}/events/stream`);
+    // EventSource cannot set headers, so the key travels as a query parameter (HTTPS strongly advised).
+    const eventSource = new EventSource(
+      `${API_BASE}/events/stream${webApiKey ? `?api_key=${encodeURIComponent(webApiKey)}` : ""}`,
+    );
 
     eventSource.addEventListener("approvals_updated", (event) => {
       try {
@@ -465,6 +484,16 @@ export default function App() {
 
   return (
     <div className="flex h-screen w-screen bg-[#0b0f19] text-slate-200 font-sans antialiased relative overflow-hidden">
+      <ApiKeyModal
+        open={authRequired}
+        error={authError}
+        onSubmit={(key) => {
+          localStorage.setItem("as_web_api_key", key);
+          setWebApiKey(key);
+          setAuthError("");
+          window.location.reload();
+        }}
+      />
       <Sidebar
         isOpen={isLeftOpen}
         onClose={() => setIsLeftOpen(false)}

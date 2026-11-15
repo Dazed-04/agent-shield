@@ -18,11 +18,9 @@ from sqlalchemy.orm import Session
 from app.agent.langgraph_agent import AgentState, compiled_agent
 from app.agent.tools import TOOLS_BY_NAME
 from app.database import get_db, init_db
-from app.detectors.jailbreak_detector import JailbreakDetector
-from app.detectors.prompt_scanner import PromptScanner
-from app.detectors.response_scanner import ResponseScanner
 from app.engine.risk_engine import RiskEngine
 from app.models import SecurityAuditLog
+from app.shield import jailbreak_detector, prompt_scanner, response_scanner
 from app.schemas import (
     ChatRequest,
     ChatResponse,
@@ -69,9 +67,6 @@ _candidates = [
 ]
 FRONTEND_DIST = next((p for p in _candidates if os.path.exists(p)), _candidates[1])
 
-prompt_scanner = PromptScanner()
-jailbreak_detector = JailbreakDetector()
-response_scanner = ResponseScanner()
 
 
 class SSEBroadcaster:
@@ -374,7 +369,7 @@ def handle_chat_request(
     initial_state: AgentState = {
         "messages": [HumanMessage(content=execution_prompt)],
         "status": "RUNNING",
-        "pending_tool_call": None,
+        "pending_tool_calls": [],
         "risk_score": inbound_score,
         "justification": justification,
         "final_output": None,
@@ -382,6 +377,9 @@ def handle_chat_request(
         "thread_id": thread_id,
         "model_id": req.model_id,
         "role": effective_role,
+        "worst_action": decision,
+        "escalate": decision == "APPROVE",
+        "notes": [],
     }
 
     try:
@@ -410,21 +408,20 @@ def handle_chat_request(
         )
 
     # 1. CHECK: Did LangGraph tool inspection block the action?
-    if final_state.get("status") == "BLOCKED" or final_state.get("risk_score", 0) > 80:
+    notes = final_state.get("notes") or []
+    full_justification = justification + (" | " + " | ".join(notes) if notes else "")
+
+    if final_state.get("status") == "BLOCKED":
         audit_entry.decision = "BLOCK"
         audit_entry.risk_score = float(final_state.get("risk_score", 85.0))
-        audit_entry.justification = final_state.get(
-            "justification", "Tool execution blocked by security policy."
-        )
+        audit_entry.justification = full_justification
         audit_entry.final_response = (
             final_state.get("final_output")
             or f"[SECURITY FIREWALL]: Execution blocked by policy for role '{effective_role}'."
         )
         audit_entry.status = "COMPLETED"
-        audit_entry.tool_calls_attempted = (
-            [final_state["pending_tool_call"]]
-            if final_state.get("pending_tool_call")
-            else []
+        audit_entry.tool_calls_attempted = list(
+            getattr(final_state["messages"][-1], "tool_calls", None) or []
         )
         db.add(audit_entry)
         db.commit()
@@ -446,19 +443,15 @@ def handle_chat_request(
         )
 
     # 2. CHECK: Did LangGraph pause for human approval?
-    if final_state.get("status") == "WAITING_APPROVAL" or (
-        final_state.get("pending_tool_call") and final_state.get("risk_score", 0) >= 50
-    ):
-        tool_call = final_state.get("pending_tool_call", {})
-        tool_name = tool_call.get("name", "unknown_tool")
+    if final_state.get("status") == "WAITING_APPROVAL":
+        pending = final_state.get("pending_tool_calls") or []
+        tool_name = ", ".join(c.get("name", "unknown_tool") for c in pending)
 
         audit_entry.decision = "APPROVE"
         audit_entry.risk_score = float(final_state.get("risk_score", 55.0))
-        audit_entry.justification = final_state.get(
-            "justification", f"Tool '{tool_name}' requires human authorization."
-        )
+        audit_entry.justification = full_justification
         audit_entry.status = "PENDING_REVIEW"
-        audit_entry.tool_calls_attempted = [tool_call]
+        audit_entry.tool_calls_attempted = pending
         hold_msg = (
             f"⏸️ **[SECURITY HOLD]**: The agent attempted to execute privileged tool `{tool_name}`. "
             f"This action has been suspended and queued in the **Human Review Queue** for confirmation."
@@ -488,11 +481,11 @@ def handle_chat_request(
         )
 
     # Normal Completion
-    audit_entry.decision = decision
+    audit_entry.decision = str(final_state.get("worst_action", decision))
     audit_entry.risk_score = max(
         inbound_score, float(final_state.get("risk_score", 0.0))
     )
-    audit_entry.justification = final_state.get("justification", justification)
+    audit_entry.justification = full_justification
 
     raw_final: str = str(final_state.get("final_output") or "Task completed.")
     audit_entry.final_response = raw_final
@@ -576,23 +569,20 @@ def resolve_approval(
 
     if req.action == "APPROVE":
         log.status = "APPROVED"
-        tool_call = log.tool_calls_attempted[0] if log.tool_calls_attempted else None
-
-        execution_output = ""
-        if tool_call and tool_call.get("name") in TOOLS_BY_NAME:
-            tool_obj = TOOLS_BY_NAME[tool_call["name"]]
+        tool_calls = log.tool_calls_attempted or []
+        outputs: list[str] = []
+        for tool_call in tool_calls:  # a held turn may contain several calls: run them all
+            if tool_call.get("name") not in TOOLS_BY_NAME:
+                continue
             try:
-                raw_result = tool_obj.invoke(tool_call.get("args", {}))
+                raw_result = TOOLS_BY_NAME[tool_call["name"]].invoke(tool_call.get("args", {}))
                 sanitized = response_scanner.scan(str(raw_result))["sanitized_response"]
-                execution_output = f"```\n{sanitized}\n```"
+                outputs.append(f"```\n{sanitized}\n```")
             except (RuntimeError, ValueError, OSError) as e:
-                execution_output = f"Execution error: {e!s}"
+                outputs.append(f"Execution error: {e!s}")
 
-        # Clean output without repetitive boilerplate headers
-        log.final_response = (
-            execution_output
-            or f"Tool `{tool_call.get('name') if tool_call else 'tool'}` completed."
-        )
+        names = ", ".join(c.get("name", "tool") for c in tool_calls) or "tool"
+        log.final_response = "\n".join(outputs) or f"Tool `{names}` completed."
         decision_label = "AUTHORIZED"
     else:
         log.status = "REJECTED"

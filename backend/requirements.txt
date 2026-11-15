@@ -1,12 +1,18 @@
-fastapi>=0.110.0
-uvicorn>=0.28.0
-pydantic>=2.6.0
-sqlalchemy>=2.0.25
-langgraph>=0.0.30
-langchain-core>=0.1.30
-langchain-groq>=0.1.0
-groq>=0.5.0
-sentence-transformers>=2.5.0
-torch>=2.2.0
-python-dotenv>=1.0.1
-numpy>=1.26.0
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.28,<1.0
+pydantic>=2.6,<3.0
+sqlalchemy>=2.0.25,<3.0
+psycopg2-binary>=2.9,<3.0        # PostgreSQL (set DATABASE_URL=postgresql+psycopg2://...)
+python-dotenv>=1.0.1,<2.0
+numpy>=1.26,<3.0
+
+# Agent orchestration & model providers
+langgraph>=0.2,<2.0
+langchain-core>=0.2,<2.0
+langchain-groq>=0.1,<2.0
+langchain-google-genai>=1.0,<4.0
+langchain-openai>=0.1,<2.0
+
+# Semantic detector (install CPU torch first in Docker; see Dockerfile)
+sentence-transformers>=2.5,<6.0
+torch>=2.2

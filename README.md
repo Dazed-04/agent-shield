@@ -7,7 +7,7 @@
 [![LangGraph](https://img.shields.io/badge/Orchestrator-LangGraph-FF6F00.svg)](https://langchain-ai.github.io/langgraph/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Build](https://img.shields.io/badge/Build-Passing-brightgreen.svg)](<>)
+[![CI](https://github.com/Dazed-04/agent-shield/actions/workflows/ci.yml/badge.svg)](https://github.com/Dazed-04/agent-shield/actions/workflows/ci.yml)
 
 ---
 
@@ -38,26 +38,29 @@ Agent Shield intercepts prompts, reasoning steps, tool invocations, and response
 │                     FASTAPI SECURITY GATEWAY                     │
 ├──────────────────────────────────────────────────────────────────┤
 │ 1. IDENTITY & INTERFACE GATEKEEPER                               │
-│    ├── Dual-Mode Auth (Permissive Dev vs. Zero-Trust Prod)       │
+│    ├── Dual-Mode Auth (Zero-Trust Prod default / Dev opt-in)     │
 │    ├── Client Interface Isolation (CLI vs. Web Entitlements)     │
 │    └── Server-Bound Role Resolution (users.json)                 │
 ├──────────────────────────────────────────────────────────────────┤
 │ 2. INBOUND INSPECTION LAYER (Layer 1)                            │
 │    ├── Prompt Scanner (Signature Heuristics & Phishing Probes)   │
 │    ├── Jailbreak Detector (all-MiniLM-L6-v2 Semantic Similarity) │
-│    └── Peak Threat Policy Engine (Immediate BLOCK if Risk >= 80) │
+│    └── Risk Engine (BLOCK > 80; 56–80 forces tool approval)      │
 ├──────────────────────────────────────────────────────────────────┤
 │ 3. AGENTIC ORCHESTRATION LAYER (LangGraph Core)                  │
-│    ├── Autonomous LLM ReAct Agent (Groq / Gemini)                │
-│    │                                                             │
+│    ├── Autonomous LLM ReAct Agent (Groq / Gemini / Ollama)       │
+│    │   with call-time provider failover                          │
 │    ▼ 4. TOOL INTERCEPTION GATEWAY (Layer 2)                      │
-│    ├── Attribute-Based Tool Access Control (policies.json)       │
-│    ├── Argument Pattern Inspector (Exploit Signature Blocker)    │
-│    ├── Scoped Dynamic Capability Leases (Session Bound)          │
-│    └── Human-in-the-Loop (HITL) State Suspension (Risk 50–80)    │
+│    ├── Fail-closed role policy (policies.json: ALLOW/WARN/       │
+│    │   APPROVE/DENY, extensions, per-session quotas)             │
+│    ├── AST analysis of generated Python (all roles)              │
+│    ├── Session capability leases (APPROVE→ALLOW only)            │
+│    ├── EVERY tool call of a turn is inspected                    │
+│    └── Human-in-the-Loop suspension (atomic, single-use)         │
 │                                                                  │
-│    ▼ 5. OUTBOUND INSPECTION LAYER (Layer 3)                      │
-│    └── Response Scanner (API Key, Secret, & PII Redactor)        │
+│    ▼ 5. OUTBOUND / TOOL-OUTPUT INSPECTION (Layer 3)              │
+│    ├── Response Scanner (secrets & validated PII redaction)      │
+│    └── Indirect-injection scan + spotlighting of tool output     │
 ├──────────────────────────────────────────────────────────────────┤
 │ 6. REAL-TIME EVENT STREAM (SSE Broadcaster)                      │
 │    └── Instant Push: Approvals, Analytics, & Live Chat Sync      │
@@ -93,14 +96,16 @@ Agent Shield intercepts prompts, reasoning steps, tool invocations, and response
 
 ### 2. Dual-Mode Security Architecture
 
-Switchable via the `SECURITY_ENV` environment variable:
+Switchable via the `SECURITY_ENV` environment variable. **The default is `production`.**
 
-- **Development Mode (`SECURITY_ENV=development`):** Permissive testing mode. Allows client-declared roles (`--admin` or `/role admin`) and interface bypasses for rapid local debugging.
-- **Production Mode (`SECURITY_ENV=production`):** Strict Zero-Trust mode. Requires authenticated `X-API-Key` headers, discards all client-claimed roles, binds privileges server-side, and enforces interface entitlements.
+- **Production Mode (default):** every protected endpoint requires an `X-API-Key`. The role is bound server-side from `users.json` and any client-claimed role is ignored. Interface entitlements (`cli` / `web`) are enforced. Approving actions, granting leases, reloading config, and reading the audit log / analytics / approval queue are **administrator-only**; ordinary users see only their own sessions and logs. Sessions are owned: user B cannot write into user A's `thread_id`.
+- **Development Mode (`SECURITY_ENV=development`):** permissive, for local debugging only. The client may declare its role and admin endpoints are open. A warning is logged at startup. Never expose this mode beyond localhost.
+
+**API keys.** `users.json` is deliberately *not* in git. Copy `backend/app/config/users.example.json` to `users.json` and replace every key. Prefer `api_key_hashes` (SHA-256) over plaintext keys; the helper commands are in the example file. Placeholder keys (`REPLACE_ME_*`) are never honoured.
 
 ### 3. Cross-Platform Real-Time Synchronization (SSE)
 
-- Replaces polling with a persistent Server-Sent Events (SSE) pipeline (`/api/events/stream`).
+- Replaces polling with a persistent Server-Sent Events (SSE) pipeline (`/api/events/stream`). Delivery is thread-safe, queues are bounded, and in production each client only receives events it is allowed to see (admins: everything; users: their own chats).
 - **Zero Log Spam:** Zero database queries while idle; updates are pushed down the wire in milliseconds only when state changes.
 - **Terminal-to-Web Sync:** Chats initiated via the CLI appear in real time in the Web UI sidebar, complete with audit scores and tool outputs.
 
@@ -132,24 +137,31 @@ agent-shield/
 ├── Dockerfile                      # Production multi-stage container build
 ├── docker-compose.yml              # Local & production container orchestration
 ├── cli.py                          # Full-featured shell CLI client
+├── requirements-cli.txt            # CLI dependencies (requests, rich)
+├── .github/workflows/ci.yml        # Lint + tests + frontend build
 ├── .gitignore
 ├── LICENSE
 ├── README.md
 ├── backend/
-│   ├── requirements.txt            # Python dependencies
+│   ├── requirements.txt            # Runtime dependencies
+│   ├── requirements-dev.txt        # + pytest, ruff, httpx
 │   ├── .env.example
 │   └── app/
-│       ├── main.py                 # FastAPI gateway, routes, & SSE broadcaster
-│       ├── config.py               # Gateway configuration & policy thresholds
+│       ├── main.py                 # FastAPI gateway & routes
+│       ├── auth.py                 # API-key auth, roles, admin/user dependencies
+│       ├── events.py               # Thread-safe SSE broadcaster
+│       ├── shield.py               # Shared detector singletons
+│       ├── config.py               # Env-driven configuration & policy thresholds
 │       ├── database.py             # SQLAlchemy engine & session factory
 │       ├── models.py               # Database audit log models
 │       ├── schemas.py              # Pydantic request/response contracts
 │       ├── config/
 │       │   ├── policies.json       # Centralized role-based tool ACLs
-│       │   └── users.json          # User registry & interface entitlements
+│       │   ├── models.json         # LLM providers & failover order
+│       │   └── users.example.json  # Template for users.json (git-ignored)
 │       ├── agent/
 │       │   ├── langgraph_agent.py  # LangGraph ReAct state machine & interceptor
-│       │   ├── orchestrator.py     # Multi-key manager & provider fallback
+│       │   ├── model_factory.py    # Providers, key rotation, call-time failover
 │       │   └── tools.py            # Sandboxed filesystem & execution tools
 │       ├── detectors/
 │       │   ├── prompt_scanner.py   # Inbound heuristic & phishing detection
@@ -157,7 +169,8 @@ agent-shield/
 │       │   ├── tool_monitor.py     # Dynamic ACL & capability lease inspector
 │       │   └── response_scanner.py # Outbound PII & API key redactor
 │       └── engine/
-│           └── risk_engine.py      # Peak-threat calculation & policy bands
+│           └── risk_engine.py      # Weighted/peak risk score & policy bands
+│   └── tests/                      # pytest suite (detectors, policy, API, agent flows)
 └── frontend/
     ├── package.json
     ├── vite.config.js
@@ -184,12 +197,11 @@ agent-shield/
 ### Option A: Running with Docker (Recommended)
 
 1. **Configure Environment:**
-   Create a `backend/.env` file:
-
-   ```env
-   GROQ_API_KEY=gsk_your_groq_api_key_here
-   GEMINI_API_KEYS=
+   ```bash
+   cp backend/.env.example backend/.env                       # add GROQ_API_KEY and/or GEMINI_API_KEYS
+   cp backend/app/config/users.example.json backend/app/config/users.json   # then replace every key
    ```
+   The container defaults to `SECURITY_ENV=production`. For a local demo without keys set `SECURITY_ENV=development` in `backend/.env`.
 
 2. **Launch the Container:**
 
@@ -211,11 +223,11 @@ agent-shield/
 cd backend
 python -m venv ../venv
 source ../venv/bin/activate       # On Windows: ..\venv\Scripts\activate
-pip install -r requirements.txt
-pip install rich                  # For CLI terminal formatting
+pip install -r requirements-dev.txt      # runtime + test tooling
+pip install -r ../requirements-cli.txt   # CLI client (requests, rich)
 
 # Create your .env file
-cp .env.example .env              # Set GROQ_API_KEY and SECURITY_ENV=development
+cp .env.example .env              # Set GROQ_API_KEY; keep SECURITY_ENV=development for local use
 
 # Start the gateway
 python -m uvicorn app.main:app --reload --port 8000
@@ -229,7 +241,7 @@ npm install
 npm run dev
 ```
 
-- Access the Vite dev server at `http://localhost:5173`.
+- Access the Vite dev server at `http://localhost:5173` (API calls are proxied to the gateway on port 8000).
 - _(Alternatively, run `npm run build` once and let FastAPI serve everything on port `8000`)_.
 
 ---
@@ -249,7 +261,7 @@ python cli.py --admin
 python cli.py --role "Data Science"
 
 # Launch in Production Mode with an API Key
-python cli.py --key shield_admin_key_9988
+python cli.py --key "$AGENT_SHIELD_KEY"      # or set AGENT_SHIELD_KEY / AGENT_SHIELD_URL
 ```
 
 ### CLI Commands
@@ -282,18 +294,52 @@ python cli.py --key shield_admin_key_9988
 
 ## API Reference
 
-| Method | Endpoint                      | Description                                                          |
-| :----- | :---------------------------- | :------------------------------------------------------------------- |
-| `POST` | `/api/chat`                   | Main entry point; runs 3-layer security inspection and agent.        |
-| `GET`  | `/api/auth/verify`            | Pre-flight handshake to verify API keys and client interface access. |
-| `GET`  | `/api/events/stream`          | Persistent Server-Sent Events (SSE) stream for zero-polling push.    |
-| `GET`  | `/api/approvals/pending`      | Lists all actions currently suspended for human authorization.       |
-| `POST` | `/api/approvals/resolve`      | Authorizes or rejects a suspended execution.                         |
-| `POST` | `/api/session/grant-lease`    | Issues a scoped, usage-bounded capability lease for a session.       |
-| `GET`  | `/api/sessions`               | Lists all unique conversational threads in the database.             |
-| `GET`  | `/api/sessions/{id}/messages` | Retrieves message history and audit traces for a specific thread.    |
-| `GET`  | `/api/logs`                   | Retrieves audit logs (supports filtering by `decision`).             |
-| `GET`  | `/api/analytics`              | Provides aggregate telemetry counts and historical metrics.          |
+*Auth* is enforced in production mode; **Admin** = `Domain Admins` role or `is_admin: true` in `users.json`. In development mode all endpoints are open.
+
+| Method | Endpoint                      | Auth  | Description                                                           |
+| :----- | :---------------------------- | :---- | :-------------------------------------------------------------------- |
+| `POST` | `/api/chat`                   | User  | Main entry point; runs 3-layer inspection and the agent.              |
+| `GET`  | `/api/auth/verify`            | –     | Pre-flight handshake to verify API keys and interface access.         |
+| `GET`  | `/api/models`                 | –     | Model names for the UI dropdown.                                      |
+| `GET`  | `/api/providers`              | Admin | Provider status and key counts.                                       |
+| `GET`  | `/api/events/stream`          | User  | SSE stream (`?api_key=` allowed here only). Filtered per caller.      |
+| `GET`  | `/api/approvals/pending`      | Admin | Actions suspended for human authorization.                            |
+| `POST` | `/api/approvals/resolve`      | Admin | Approve/reject a held action (single-use; 409 on replay).             |
+| `POST` | `/api/session/grant-lease`    | Admin | Scoped, usage-bounded lease that downgrades APPROVE → ALLOW.          |
+| `GET`  | `/api/sessions`               | User  | Caller's sessions (admins: all).                                      |
+| `GET`  | `/api/sessions/{id}/messages` | User  | Message history for a session the caller owns.                        |
+| `GET`  | `/api/logs`                   | User  | Audit logs (`decision`, `limit`, `offset`); non-admins see their own. |
+| `GET`  | `/api/analytics`              | User  | Aggregates: counts, avg risk, avg latency, 14-day timeline.           |
+| `POST` | `/api/config/reload`          | Admin | Hot-reload `.env`, `policies.json` and key pools.                     |
+
+Each audit record stores the per-stage latency (`triggered_detectors.timings_ms`) so overhead can be reported.
+
+---
+
+## Security Model & Known Limitations
+
+What is enforced: independent inbound / tool / outbound inspection; fail-closed tool policy; AST screening of generated code for every role; indirect-injection scanning and "spotlighting" (untrusted data is delimited and the model is told not to obey it) for tool output, attachments and RAG context; secret and validated-PII redaction (including the gateway's own credentials); atomic single-use approvals with re-checking at execution time; server-bound identities and per-user data isolation.
+
+Honest limits (state these in any evaluation):
+
+- Pattern and embedding detectors are **evadable** by novel paraphrase, encodings and other languages. Detection numbers must be measured, not assumed.
+- `execute_python_code` uses a scrubbed environment, rlimits and static analysis, but a subprocess is **not** a sandbox boundary. Run the gateway in the provided hardened container.
+- Each chat turn is an independent run; conversation memory is not carried between turns.
+- In-memory leases/quotas are per process (single worker). Use one worker or move them to a shared store before scaling out.
+- Web-UI API keys live in `localStorage`; put TLS in front of the gateway.
+
+---
+
+## Development & Testing
+
+```bash
+cd backend
+pip install -r requirements-dev.txt
+AGENT_SHIELD_DISABLE_EMBEDDINGS=1 pytest -q   # no network or API keys needed
+ruff check app tests
+```
+
+The tests drive the full pipeline with a scripted fake LLM (direct and indirect injection, parallel tool calls, approval/lease flows, auth and isolation). CI runs lint, tests and the frontend build on every push.
 
 ---
 

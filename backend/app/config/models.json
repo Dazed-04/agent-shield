@@ -3,10 +3,13 @@
   "providers": [
     {
       "id": "google-gemini",
-      "name": "Google Gemini (1.5 Flash)",
+      "name": "Google Gemini (2.5 Flash)",
       "type": "gemini",
-      "model": "gemini-1.5-flash",
-      "api_keys": ["${GEMINI_API_KEYS}", "${GEMINI_API_KEY}"],
+      "model": "gemini-2.5-flash",
+      "api_keys": [
+        "${GEMINI_API_KEYS}",
+        "${GEMINI_API_KEY}"
+      ],
       "enabled": true,
       "timeout_seconds": 15
     },
@@ -15,7 +18,9 @@
       "name": "Groq Cloud (GPT-OSS 120B)",
       "type": "groq",
       "model": "openai/gpt-oss-120b",
-      "api_keys": ["${GROQ_API_KEY}"],
+      "api_keys": [
+        "${GROQ_API_KEY}"
+      ],
       "enabled": true,
       "timeout_seconds": 10
     },

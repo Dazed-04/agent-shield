@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Any
 
 from pydantic import SecretStr
@@ -53,13 +54,27 @@ def _resolve_env_var(value: str) -> str:
     return re.sub(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}", _replace, value).strip()
 
 
-def load_model_registry() -> list[dict[str, Any]]:
-    if not os.path.exists(MODELS_CONFIG_PATH):
-        return []
+_REGISTRY_CACHE: dict[str, Any] = {"mtime": None, "raw": None}
 
+
+def _read_registry_file() -> dict[str, Any] | None:
+    """Parse models.json, re-reading only when the file changes."""
     try:
-        with open(MODELS_CONFIG_PATH, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
+        mtime = os.path.getmtime(MODELS_CONFIG_PATH)
+    except OSError:
+        return None
+    if _REGISTRY_CACHE["mtime"] != mtime:
+        with open(MODELS_CONFIG_PATH, encoding="utf-8") as f:
+            _REGISTRY_CACHE["raw"] = json.load(f)
+        _REGISTRY_CACHE["mtime"] = mtime
+    return _REGISTRY_CACHE["raw"]
+
+
+def load_model_registry() -> list[dict[str, Any]]:
+    try:
+        raw_data = _read_registry_file()
+        if raw_data is None:
+            return []
 
         providers = raw_data.get("providers", [])
         cleaned = []
@@ -71,7 +86,7 @@ def load_model_registry() -> list[dict[str, Any]]:
             if "base_url" in entry:
                 entry["base_url"] = _resolve_env_var(entry["base_url"])
 
-            raw_keys = entry.get("api_keys", [])
+            raw_keys = list(entry.get("api_keys", []))
             if entry.get("api_key"):
                 raw_keys.append(entry["api_key"])
 
@@ -87,6 +102,7 @@ def load_model_registry() -> list[dict[str, Any]]:
 
         return cleaned
     except (json.JSONDecodeError, OSError) as e:
+        _REGISTRY_CACHE["mtime"] = None
         logger.error("Error parsing models.json: %s", e)
         return []
 
@@ -111,108 +127,80 @@ def get_available_models_for_ui() -> list[dict[str, Any]]:
     return available
 
 
+_KEY_LOCK = threading.Lock()
+
+
 def _get_next_key(provider_id: str, keys: list[str]) -> str | None:
     if not keys:
         return None
-    if provider_id not in _PROVIDER_KEY_CYCLERS:
-        _PROVIDER_KEY_CYCLERS[provider_id] = itertools.cycle(keys)
-    return next(_PROVIDER_KEY_CYCLERS[provider_id])
+    with _KEY_LOCK:
+        if provider_id not in _PROVIDER_KEY_CYCLERS:
+            _PROVIDER_KEY_CYCLERS[provider_id] = itertools.cycle(keys)
+        return next(_PROVIDER_KEY_CYCLERS[provider_id])
 
 
-def get_configured_llm(
-    tools: list[Any], requested_id: str | None = None
-) -> tuple[Any, str]:
+def _build_chat_model(target: dict[str, Any]) -> Any | None:
+    """Instantiate one provider's chat model (rotating through its API keys). None if unusable."""
+    p_type = target.get("type", "openai_compatible").lower()
+    p_model = target.get("model", "")
+    p_id = target.get("id", "provider")
+    keys = target.get("resolved_keys", [])
+    timeout = target.get("timeout_seconds", 12)
+
+    try:
+        if p_type == "gemini":
+            api_key = _get_next_key(p_id, keys)
+            if not api_key or ChatGoogleGenerativeAI is None:
+                return None
+            return ChatGoogleGenerativeAI(
+                model=p_model, google_api_key=api_key, temperature=0.2, timeout=timeout
+            )
+        if p_type == "groq":
+            api_key = _get_next_key(p_id, keys)
+            if not api_key or ChatGroq is None:
+                return None
+            return ChatGroq(
+                model=p_model,
+                api_key=SecretStr(api_key),
+                temperature=0.2,
+                max_tokens=800,
+                timeout=timeout,
+            )
+        if p_type in ("openai_compatible", "ollama"):
+            if ChatOpenAI is None:
+                return None
+            return ChatOpenAI(
+                model=p_model or "llama3.1:8b",
+                base_url=target.get("base_url", "http://localhost:11434/v1"),
+                api_key=SecretStr(_get_next_key(p_id, keys) or "none"),
+                temperature=0.2,
+                timeout=timeout,
+                max_retries=1,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.error("Could not initialise provider %s: %s", p_id, e)
+    return None
+
+
+def get_llm_with_fallbacks(tools: list[Any], requested_id: str | None = None) -> Any:
+    """Return a tool-bound chat model that fails over across providers *at call time*.
+
+    The requested provider (if any) is tried first, then the rest in models.json order. Failover
+    uses LangChain ``with_fallbacks`` so a rate limit / outage during ``invoke`` moves on to the
+    next provider (building a client alone can never detect those).
+    """
     providers = load_model_registry()
     if not providers:
         raise RuntimeError("No enabled AI providers found in config/models.json.")
-
-    # If user selected a specific model from the dropdown, prioritize it first!
     if requested_id:
-        providers = sorted(
-            providers, key=lambda p: 0 if p.get("id") == requested_id else 1
-        )
+        providers = sorted(providers, key=lambda p: 0 if p.get("id") == requested_id else 1)
 
-    last_error: Exception | None = None
-
+    runnables = []
     for target in providers:
-        p_type = target.get("type", "openai_compatible").lower()
-        p_model = target.get("model", "")
-        p_id = target.get("id", "provider")
-        keys = target.get("resolved_keys", [])
-        timeout = target.get("timeout_seconds", 12)
-
-        # 1. Google Gemini Provider
-        if p_type == "gemini":
-            api_key = _get_next_key(p_id, keys)
-            if not api_key:
-                continue
-
-            if ChatGoogleGenerativeAI is None:
-                continue
-
-            try:
-                llm = ChatGoogleGenerativeAI(
-                    model=p_model or "gemini-1.5-flash",
-                    google_api_key=api_key,
-                    temperature=0.2,
-                    timeout=timeout,
-                )
-                return llm.bind_tools(tools), f"Gemini ({p_model})"
-            except Exception as e:  # noqa: BLE001
-                last_error = e
-                continue
-
-        # 2. Groq Cloud Provider (With auto-fallback on retired models)
-        elif p_type == "groq":
-            api_key = _get_next_key(p_id, keys)
-            if not api_key:
-                continue
-
-            if ChatGroq is None:
-                continue
-
-            candidate_models = [
-                p_model,
-                "openai/gpt-oss-120b",
-                "openai/gpt-oss-20b",
-                "llama-3.1-8b-instant",
-            ]
-            for m_candidate in candidate_models:
-                if not m_candidate:
-                    continue
-                try:
-                    llm = ChatGroq(
-                        model=m_candidate,
-                        api_key=SecretStr(api_key),
-                        temperature=0.2,
-                        max_tokens=800,
-                        timeout=timeout,
-                    )
-                    return llm.bind_tools(tools), f"Groq ({m_candidate})"
-                except Exception as e:  # noqa: BLE001
-                    last_error = e
-                    continue
-
-        # 3. Universal OpenAI-Compatible (Local Ollama, vLLM, etc.)
-        elif p_type in ("openai_compatible", "ollama"):
-            api_key = _get_next_key(p_id, keys) or "none"
-            base_url = target.get("base_url", "http://localhost:11434/v1")
-
-            if ChatOpenAI is None:
-                continue
-
-            try:
-                llm = ChatOpenAI(
-                    model=p_model or "llama3.1:8b",
-                    base_url=base_url,
-                    api_key=SecretStr(api_key),
-                    temperature=0.2,
-                    timeout=timeout,
-                    max_retries=1,
-                )
-                return llm.bind_tools(tools), f"Local/Compatible ({p_model})"
-            except Exception as e:  # noqa: BLE001
-                last_error = e
-                continue
-
-    raise RuntimeError(f"All configured providers failed. Last error: {last_error}")
+        model = _build_chat_model(target)
+        if model is not None:
+            runnables.append(model.bind_tools(tools))
+    if not runnables:
+        raise RuntimeError("All configured providers are unavailable (missing API keys or packages).")
+    primary, *rest = runnables
+    return primary.with_fallbacks(rest) if rest else primary

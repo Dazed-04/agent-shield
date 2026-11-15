@@ -10,7 +10,7 @@ from langchain_core.messages import (
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
-from app.agent.model_factory import get_configured_llm
+from app.agent.model_factory import get_llm_with_fallbacks
 from app.agent.tools import ALL_TOOLS, TOOLS_BY_NAME
 from app.detectors.response_scanner import ResponseScanner
 from app.detectors.tool_monitor import ToolMonitor
@@ -51,8 +51,7 @@ SYSTEM_INSTRUCTION = SystemMessage(
 
 def get_llm(model_id: str | None = None):
     """Loads requested model (or default priority failover) from models.json."""
-    llm_with_tools, _ = get_configured_llm(ALL_TOOLS, requested_id=model_id)
-    return llm_with_tools
+    return get_llm_with_fallbacks(ALL_TOOLS, model_id)
 
 
 def agent_node(state: AgentState):

@@ -13,12 +13,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.agent.langgraph_agent import AgentState, compiled_agent
 from app.agent.tools import TOOLS_BY_NAME
-from app.database import Base, engine, get_db
+from app.database import get_db, init_db
 from app.detectors.jailbreak_detector import JailbreakDetector
 from app.detectors.prompt_scanner import PromptScanner
 from app.detectors.response_scanner import ResponseScanner
@@ -50,14 +49,7 @@ def load_user_registry() -> dict[str, Any]:
     return {"api_keys": {}}
 
 
-Base.metadata.create_all(bind=engine)
-
-# Auto-migrate SQLite schema for thread_id if upgrading existing DB
-with engine.connect() as conn, contextlib.suppress(Exception):
-    conn.execute(
-        text("ALTER TABLE security_audit_logs ADD COLUMN thread_id VARCHAR(64)")
-    )
-    conn.commit()
+init_db()
 
 app = FastAPI(title="Agent Shield - Production Gateway", version="2.0.0")
 

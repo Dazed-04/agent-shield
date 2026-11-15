@@ -5,16 +5,23 @@ services:
       dockerfile: Dockerfile
     container_name: agent-shield-gateway
     ports:
-      - "8000:8000"
-    # This directly injects your API keys from the backend folder into the container
+      - "127.0.0.1:8000:8000"   # localhost only; put a TLS reverse proxy in front for anything else
     env_file:
-      - ./backend/.env
+      - path: ./backend/.env
+        required: false
     environment:
-      # These override whatever is in the .env file for production routing
-      #- SECURITY_ENV=production
-      - DATABASE_URL=sqlite:////app/data/agentshield.db
+      # Secure by default. Set SECURITY_ENV=development in backend/.env for local demos.
+      SECURITY_ENV: ${SECURITY_ENV:-production}
+      DATABASE_URL: sqlite:////app/data/agentshield.db
     volumes:
       - ./sandbox:/app/sandbox
       - ./data:/app/data
-      - ./backend/app/config:/app/app/config
+      # users.json (API keys) is NOT in git: copy users.example.json -> users.json and edit.
+      - ./backend/app/config:/app/app/config:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped

@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.agent.langgraph_agent import AgentState, compiled_agent
@@ -123,23 +123,49 @@ def get_pending_approvals_list(db: Session) -> list[dict[str, Any]]:
 
 
 def get_analytics_payload(db: Session, user: str | None = None) -> dict[str, Any]:
-    query = db.query(SecurityAuditLog)
+    """Aggregates in SQL - O(1) memory regardless of log volume."""
+    base = db.query(SecurityAuditLog)
     if user is not None:
-        query = query.filter(SecurityAuditLog.user_id == user)
-    logs = query.all()
+        base = base.filter(SecurityAuditLog.user_id == user)
+
     counts = {"ALLOW": 0, "WARN": 0, "APPROVE": 0, "BLOCK": 0}
-    for item in logs:
-        key = str(item.decision)
-        counts[key] = counts.get(key, 0) + 1
+    rows = base.with_entities(
+        SecurityAuditLog.decision,
+        func.count(SecurityAuditLog.id),
+        func.avg(SecurityAuditLog.risk_score),
+    ).group_by(SecurityAuditLog.decision)
+    avg_risk: dict[str, float] = {}
+    for decision, n, avg in rows:
+        counts[str(decision)] = int(n)
+        avg_risk[str(decision)] = round(float(avg or 0.0), 2)
+
+    latency = base.with_entities(func.avg(SecurityAuditLog.latency_ms)).scalar()
+    recent = base.order_by(SecurityAuditLog.id.desc()).limit(10).all()[::-1]
+
+    day = func.date(SecurityAuditLog.timestamp)
+    timeline: dict[str, dict[str, int]] = {}
+    for d, decision, n in (
+        base.with_entities(day, SecurityAuditLog.decision, func.count(SecurityAuditLog.id))
+        .group_by(day, SecurityAuditLog.decision)
+        .order_by(day.desc())
+        .limit(14 * 4)
+    ):
+        timeline.setdefault(str(d), {})[str(decision)] = int(n)
+
     return {
-        "total_requests": len(logs),
+        "total_requests": sum(counts.values()),
         "breakdown": counts,
-        "recent_logs": [serialize_log(item) for item in logs[-10:]],
+        "avg_risk_by_decision": avg_risk,
+        "avg_latency_ms": round(float(latency), 2) if latency is not None else None,
+        "timeline": dict(sorted(timeline.items())),
+        "recent_logs": [serialize_log(entry) for entry in recent],
     }
 
 
 def _push_state(db: Session) -> None:
-    """Notify admin dashboards that approvals/analytics changed ."""
+    """Notify admin dashboards that approvals/analytics changed (skipped if nobody is listening)."""
+    if not broadcaster.subscribers:
+        return
     broadcaster.publish_sync(
         "analytics_updated", {"analytics": get_analytics_payload(db)}, admin_only=True
     )
@@ -520,11 +546,23 @@ def grant_lease(req: GrantLeaseRequest, _: Admin) -> dict[str, Any]:
 
 # --------------------------------------------------------------------------- audit & analytics
 @app.get("/api/logs")
-def get_logs_by_decision(db: DbSession, principal: User, decision: str | None = None) -> list[dict[str, Any]]:
+def get_logs_by_decision(
+    db: DbSession,
+    principal: User,
+    decision: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
     query = _scope(db.query(SecurityAuditLog), principal)
     if decision:
         query = query.filter(SecurityAuditLog.decision == decision.upper())
-    return [serialize_log(r) for r in query.order_by(SecurityAuditLog.id.desc()).limit(50).all()]
+    rows = (
+        query.order_by(SecurityAuditLog.id.desc())
+        .offset(max(offset, 0))
+        .limit(min(max(limit, 1), 200))
+        .all()
+    )
+    return [serialize_log(r) for r in rows]
 
 
 @app.get("/api/analytics")
@@ -534,20 +572,24 @@ def get_analytics(db: DbSession, principal: User) -> dict[str, Any]:
 
 @app.get("/api/sessions")
 def get_all_sessions(db: DbSession, principal: User) -> list[dict[str, Any]]:
-    logs = _scope(db.query(SecurityAuditLog), principal).order_by(SecurityAuditLog.id.desc()).all()
-    seen: set[str] = set()
-    sessions = []
-    for r in logs:
-        if r.thread_id and r.thread_id not in seen:
-            seen.add(r.thread_id)
-            sessions.append(
-                {
-                    "id": r.thread_id,
-                    "title": (f"CLI: {r.prompt[:22]}..." if str(r.thread_id).startswith("cli_") else r.prompt[:24] + "..."),
-                    "latest_activity": r.timestamp.isoformat() if r.timestamp else None,
-                }
-            )
-    return sessions
+    latest_ids = _scope(
+        db.query(func.max(SecurityAuditLog.id).label("mid")), principal
+    ).group_by(SecurityAuditLog.thread_id).subquery()
+    rows = (
+        db.query(SecurityAuditLog)
+        .join(latest_ids, SecurityAuditLog.id == latest_ids.c.mid)
+        .order_by(SecurityAuditLog.id.desc())
+        .limit(200)
+        .all()
+    )
+    return [
+        {
+            "id": r.thread_id,
+            "title": (f"CLI: {r.prompt[:22]}..." if str(r.thread_id).startswith("cli_") else r.prompt[:24] + "..."),
+            "latest_activity": r.timestamp.isoformat() if r.timestamp else None,
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/sessions/{thread_id}/messages")

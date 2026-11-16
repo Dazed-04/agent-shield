@@ -71,6 +71,19 @@ export default function ApprovalModal({
             Cancel
           </button>
           <button
+            onClick={async () => {
+              await axios.post(`${API_BASE}/threats/learn`, {
+                threat_text: approval.prompt,
+              });
+              alert(
+                "Attack signature vectorized and learned into threat database!",
+              );
+            }}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-amber-500/40 hover:bg-amber-500/10 text-amber-300 text-xs font-medium cursor-pointer"
+          >
+            🚩 Flag
+          </button>
+          <button
             onClick={() => onResolve(approval.id, "REJECT")}
             className="flex items-center gap-1.5 bg-rose-600 hover:bg-rose-700 text-white px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer"
           >

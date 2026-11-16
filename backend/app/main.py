@@ -407,6 +407,15 @@ def handle_chat_request(request: Request, req: ChatRequest, db: DbSession, princ
     status = final_state.get("status")
     worst = str(final_state.get("worst_action", decision))
     notes: list[str] = final_state.get("notes", [])
+    if status in ("BLOCKED", "WAITING_APPROVAL"):
+        # The tool layer overrode the inbound verdict: don't lead with "Executing directly".
+        _, _, triggered_text = justification.partition(" Triggered: ")
+        head = (
+            f"Prompt screening passed ({inbound_score}/100)."
+            if decision == "ALLOW"
+            else f"Prompt screening: {decision} ({inbound_score}/100)."
+        )
+        justification = head + (f" Triggered: {triggered_text}" if triggered_text else "")
     full_justification = justification + (" | " + " | ".join(notes) if notes else "")
     risk = float(final_state.get("risk_score", inbound_score))
 

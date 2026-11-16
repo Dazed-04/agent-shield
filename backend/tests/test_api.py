@@ -73,6 +73,9 @@ def test_standard_user_tool_call_blocked(client, llm):
     llm(AIMessage(content="", tool_calls=[tool_call("execute_python_code", {"code": "print(1)"})]))
     r = chat(client, "compute", H(STD_KEY)).json()
     assert r["decision"] == "BLOCK" and "blocked" in r["reply"].lower()
+    # the explanation must lead with the real reason, not the inbound "Executing directly"
+    assert "Executing directly" not in r["justification"]
+    assert "tool_monitor" in r["justification"]
 
 
 def test_approval_flow_executes_once_and_only_after_admin_resolves(client, llm):

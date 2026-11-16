@@ -31,3 +31,14 @@ def test_lease_limits():
         GrantLeaseRequest(thread_id="t", tool_name="x", max_uses=10**6)
     with pytest.raises(ValidationError):
         GrantLeaseRequest(thread_id="t", tool_name="x", duration_seconds=0)
+
+
+def test_add_threat_request_bounds():
+    from pydantic import ValidationError
+
+    from app.schemas import AddThreatRequest
+
+    assert AddThreatRequest(threat_text="a long enough attack phrase").threat_text
+    for bad in ("", "tiny", "x" * 301):
+        with pytest.raises(ValidationError):
+            AddThreatRequest(threat_text=bad)

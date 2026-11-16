@@ -10,6 +10,7 @@ os.environ["AGENT_SHIELD_DISABLE_EMBEDDINGS"] = "1"
 os.environ["DATABASE_URL"] = f"sqlite:///{_TMP}/test.db"
 os.environ["AGENT_SHIELD_SANDBOX_DIR"] = os.path.join(_TMP, "sandbox")
 os.environ["AGENT_SHIELD_USERS_FILE"] = os.path.join(_TMP, "users.json")
+os.environ["THREAT_VECTORS_PATH"] = os.path.join(_TMP, "threat_vectors.json")
 os.environ.pop("SECURITY_ENV", None)
 
 ADMIN_KEY, DS_KEY, STD_KEY, STD2_KEY = "k_admin_test", "k_ds_test", "k_std_test", "k_std2_test"

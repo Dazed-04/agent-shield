@@ -311,6 +311,9 @@ python cli.py --key "$AGENT_SHIELD_KEY"      # or set AGENT_SHIELD_KEY / AGENT_S
 | `GET`  | `/api/logs`                   | User  | Audit logs (`decision`, `limit`, `offset`); non-admins see their own. |
 | `GET`  | `/api/analytics`              | User  | Aggregates: counts, avg risk, avg latency, 14-day timeline.           |
 | `POST` | `/api/config/reload`          | Admin | Hot-reload `.env`, `policies.json` and key pools.                     |
+| `POST` | `/api/threats/learn`          | Admin | Add a validated attack phrase to the semantic detector (persisted).   |
+| `GET`  | `/api/threats`                | Admin | List learned phrases and detector mode.                               |
+| `POST` | `/api/threats/forget`         | Admin | Remove a learned phrase (built-in anchors are protected).             |
 
 Each audit record stores the per-stage latency (`triggered_detectors.timings_ms`) so overhead can be reported.
 

@@ -56,3 +56,9 @@ CODE_EXEC_TIMEOUT_S = int(_env_float("CODE_EXEC_TIMEOUT_S", 5))
 CODE_EXEC_MEMORY_MB = int(_env_float("CODE_EXEC_MEMORY_MB", 256))
 MAX_TOOL_OUTPUT_CHARS = int(_env_float("MAX_TOOL_OUTPUT_CHARS", 20000))
 MAX_PROMPT_CHARS = int(_env_float("MAX_PROMPT_CHARS", 50000))
+
+# Learned threat phrases (active learning). Keep this on a writable volume in containers.
+THREAT_VECTORS_PATH = os.getenv(
+    "THREAT_VECTORS_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "config/threat_vectors.json")),
+)

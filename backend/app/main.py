@@ -27,6 +27,7 @@ from app.engine.risk_engine import RiskEngine
 from app.events import broadcaster
 from app.models import SecurityAuditLog
 from app.schemas import (
+    AddThreatRequest,
     ChatRequest,
     ChatResponse,
     GrantLeaseRequest,
@@ -624,6 +625,38 @@ def get_session_messages(thread_id: str, db: DbSession, principal: User) -> list
 @app.post("/api/config/reload")
 def trigger_config_reload(_: Admin) -> dict[str, Any]:
     return reload_all_system_configs()
+
+
+# --------------------------------------------------------------------------- active learning
+@app.post("/api/threats/learn")
+def learn_new_threat(req: AddThreatRequest, admin: Admin) -> dict[str, Any]:
+    """Add a human-validated attack phrase to the semantic detector without a restart."""
+    if not jailbreak_detector.add_threat_vector(req.threat_text):
+        return {"status": "skipped", "message": "Threat already indexed, invalid, or limit reached."}
+    logger.info("Threat vector learned by %s: %r", admin.user, req.threat_text[:80])
+    return {
+        "status": "learned",
+        "total_threat_vectors": len(jailbreak_detector.jailbreak_anchors),
+        "sample": req.threat_text[:50],
+    }
+
+
+@app.get("/api/threats")
+def list_threats(_: Admin) -> dict[str, Any]:
+    return {
+        "builtin": len(jailbreak_detector.builtin_anchors),
+        "learned": list(jailbreak_detector.learned),
+        "mode": jailbreak_detector.mode,
+    }
+
+
+@app.post("/api/threats/forget")
+def forget_threat(req: AddThreatRequest, admin: Admin) -> dict[str, Any]:
+    """Undo a learned phrase (e.g. one that causes false positives). Built-ins are protected."""
+    removed = jailbreak_detector.remove_threat_vector(req.threat_text)
+    if removed:
+        logger.info("Threat vector removed by %s: %r", admin.user, req.threat_text[:80])
+    return {"status": "removed" if removed else "not_found"}
 
 
 # Static SPA serving MUST stay last so it does not shadow /api routes.

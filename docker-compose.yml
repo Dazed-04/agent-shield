@@ -13,6 +13,7 @@ services:
       # Secure by default. Set SECURITY_ENV=development in backend/.env for local demos.
       SECURITY_ENV: ${SECURITY_ENV:-production}
       DATABASE_URL: sqlite:////app/data/agentshield.db
+      THREAT_VECTORS_PATH: /app/data/threat_vectors.json   # learned phrases need a writable volume
     volumes:
       - ./sandbox:/app/sandbox
       - ./data:/app/data

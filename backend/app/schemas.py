@@ -15,6 +15,10 @@ class ChatRequest(BaseModel):
     attachment: dict[str, Any] | None = None
 
 
+class AddThreatRequest(BaseModel):
+    threat_text: str = Field(min_length=12, max_length=300)
+
+
 class ChatResponse(BaseModel):
     log_id: int
     decision: str

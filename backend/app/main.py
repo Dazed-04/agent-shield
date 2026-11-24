@@ -23,7 +23,6 @@ from app.agent.tools import TOOLS_BY_NAME
 from app.auth import Principal, authenticate, is_development, require_admin, require_user
 from app.config import CORS_ORIGINS
 from app.database import SessionLocal, get_db, init_db
-from app.engine.risk_engine import RiskEngine
 from app.events import broadcaster
 from app.models import SecurityAuditLog
 from app.schemas import (
@@ -35,8 +34,8 @@ from app.schemas import (
 )
 from app.shield import (
     jailbreak_detector,
-    prompt_scanner,
     response_scanner,
+    screen_inbound,
     tool_monitor,
 )
 
@@ -295,18 +294,10 @@ def handle_chat_request(request: Request, req: ChatRequest, db: DbSession, princ
     untrusted_text = "\n\n".join(untrusted_parts) or None
 
     # 4. Inbound Layer 1
-    timings: dict[str, float] = {}
-    t = time.perf_counter()
-    p_res = prompt_scanner.scan(req.prompt, untrusted_text)
-    timings["prompt_scanner"] = round((time.perf_counter() - t) * 1000, 2)
-    t = time.perf_counter()
-    j_res = jailbreak_detector.scan(req.prompt)
-    if untrusted_text:
-        j_ctx = jailbreak_detector.scan(untrusted_text)
-        if j_ctx["score"] > j_res["score"]:
-            j_res = {**j_ctx, "reason": f"(in attached/retrieved content) {j_ctx['reason']}"}
-    timings["jailbreak_detector"] = round((time.perf_counter() - t) * 1000, 2)
-    inbound_score, decision, justification = RiskEngine.aggregate_and_decide(p_res, j_res)
+    screen = screen_inbound(req.prompt, untrusted_text)
+    p_res, j_res = screen.prompt_result, screen.jailbreak_result
+    inbound_score, decision, justification = screen.score, screen.decision, screen.justification
+    timings: dict[str, float] = screen.timings
 
     audit = SecurityAuditLog(
         thread_id=thread_id,

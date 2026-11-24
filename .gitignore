@@ -44,3 +44,7 @@ Thumbs.db
 
 # API keys / identities (use users.example.json as the template)
 backend/app/config/users.json
+
+# evaluation data (fetched by `python -m evaluation prepare`, never committed)
+backend/evaluation/data/
+backend/evaluation/results/

@@ -76,7 +76,9 @@ def build_report(rows: list[dict[str, Any]], run_meta: dict[str, Any], calibrate
     timing_keys = sorted({k for r in rows for k in r["timings_ms"]})
     latency = {k: latency_summary([r["timings_ms"][k] for r in rows if k in r["timings_ms"]]) for k in timing_keys}
 
-    comb = sorted(rows, key=lambda r: r["scores"]["combined"])
+    # Error examples come from the DEV split only. Showing test-split errors would invite fixing the
+    # detectors against held-out data, which silently turns the test numbers into training numbers.
+    comb = sorted((r for r in rows if r["split"] == "dev"), key=lambda r: r["scores"]["combined"])
     fps = [r for r in reversed(comb) if r["label"] == 0 and r["scores"]["combined"] > base_ops["alert"]][:15]
     fns = [r for r in comb if r["label"] == 1 and r["scores"]["combined"] <= base_ops["alert"]][:15]
     brief = lambda r: {k: r[k] for k in ("id", "source", "category", "split")} | {"score": r["scores"]["combined"]}  # noqa: E731

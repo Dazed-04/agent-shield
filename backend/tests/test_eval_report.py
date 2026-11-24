@@ -31,7 +31,9 @@ def test_report_numbers_are_correct_and_complete():
     assert set(rep["groups"]) >= {"all", "split:dev", "split:test", "source:s1", "source:s1|split:test", "kind:jailbreak", "kind:benign"}
     assert rep["latency_ms"]["total"]["p50"] == 3.0
     assert rep["decision_counts"]["s1"]["attack"]["BLOCK"] == 16
-    assert {r["id"] for r in rep["false_negatives"]} == {f"a{i}" for i in range(16, 20)}
+    # error examples are dev-only: dev rows are the odd indices, so only a17 and a19 are shown
+    assert {r["id"] for r in rep["false_negatives"]} == {"a17", "a19"}
+    assert all(r["split"] == "dev" for r in rep["false_negatives"] + rep["false_positives"])
     assert rep["attack_detection_by_category"]["s1/c"]["n"] == 20
 
 

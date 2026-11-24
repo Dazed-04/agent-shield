@@ -38,3 +38,9 @@ def test_own_credentials_are_never_echoed(monkeypatch):
     scanner = ResponseScanner()
     res = scanner.scan("The token is super-secret-value-12345 okay")
     assert "super-secret-value-12345" not in res["sanitized_response"] and res["has_secret"]
+
+
+def test_card_redaction_keeps_the_following_whitespace():
+    out = rs.scan("card 4111 1111 1111 1111 Q3 units")["sanitized_response"]
+    assert out == "card [REDACTED_PII] Q3 units"
+    assert "4111 1111 1111 1112" in rs.scan("order 4111 1111 1111 1112 shipped")["sanitized_response"]  # fails Luhn

@@ -5,6 +5,8 @@
   scan       score every sample through the production detectors -> results/<run>/
   calibrate  fit thresholds on the dev split of a run
   report     compute metrics and write report.json / report.md / report.csv / ablation.tex
+  agent-scan    run the end-to-end agent benchmark (needs a model key, or --llm scripted-gullible for a dry run)
+  agent-report  summarise an agent-scan run into tables
 """
 
 from __future__ import annotations
@@ -106,6 +108,69 @@ def _cmd_report(a: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_agent_scan(a: argparse.Namespace) -> int:
+    import datetime as dt
+
+    sandbox = Path(tempfile.mkdtemp(prefix="eval_sandbox_"))
+    os.environ["AGENT_SHIELD_SANDBOX_DIR"] = str(sandbox)
+    os.environ["AGENT_SHIELD_DISABLE_EMBEDDINGS"] = "1" if a.embeddings == "off" else os.environ.get("AGENT_SHIELD_DISABLE_EMBEDDINGS", "0")
+    os.environ["THREAT_VECTORS_PATH"] = str(Path(tempfile.mkdtemp(prefix="eval_tv_")) / "none.json")
+    if a.llm == "real":
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+        except ImportError:
+            pass
+    from unittest import mock
+
+    import app.agent.langgraph_agent as graph
+
+    from .agent_bench import build_scenarios
+    from .agent_eval import DEFAULT_ROLES, SHIELDED, SYSTEMS, run_matrix
+    from .runner import run_metadata
+    from .scripted_llm import ScriptedAgentLLM
+
+    scenarios = build_scenarios()
+    if a.limit_scenarios:
+        scenarios = scenarios[: a.limit_scenarios]
+    systems = a.systems or list(SYSTEMS)
+    roles = a.roles or list(DEFAULT_ROLES)
+    n_jobs = sum(len(roles) if s in SHIELDED else 1 for s in systems) * len(scenarios) * a.repeats
+    print(f"{n_jobs} runs ({len(scenarios)} scenarios x {len(systems)} systems x {a.repeats} repeat(s)); "
+          f"each run makes ~2-4 model calls" + (" (REAL model: check your provider quota)" if a.llm == "real" else " (scripted: free)"))
+    patch = (mock.patch.object(graph, "get_llm_with_fallbacks", lambda tools, mid=None: ScriptedAgentLLM(a.llm.split("-", 1)[1]))
+             if a.llm.startswith("scripted") else mock.patch.object(graph, "__name__", graph.__name__))
+    rid = f"{dt.datetime.now(dt.UTC):%Y%m%dT%H%M%S}-agent-{a.llm}" + (f"-{a.tag}" if a.tag else "")
+    out = Path(a.results_dir) / rid
+    out.mkdir(parents=True, exist_ok=False)
+    with patch, (out / "agent_runs.jsonl").open("w", encoding="utf-8") as f:
+        for rec in run_matrix(scenarios, systems, roles, a.model_id or None, a.repeats, progress=lambda i, n: print(f"  {i}/{n}", flush=True)):
+            f.write(json.dumps(rec) + "\n")
+            f.flush()
+    meta = run_metadata(0, [])
+    meta.update({"run_id": rid, "llm": a.llm, "model_id": a.model_id or None, "repeats": a.repeats, "n_scenarios": len(scenarios),
+                 "systems": systems, "roles": roles})
+    meta.pop("datasets", None)
+    (out / "agent_run.json").write_text(json.dumps(meta, indent=2))
+    print(f"run {out}")
+    return 0
+
+
+def _cmd_agent_report(a: argparse.Namespace) -> int:
+    from .agent_report import render_markdown, summarize
+    from .runner import read_predictions
+
+    run = Path(a.run)
+    rows = read_predictions(run / "agent_runs.jsonl")
+    meta = json.loads((run / "agent_run.json").read_text())
+    summary = summarize(rows)
+    (run / "agent_report.json").write_text(json.dumps({"meta": meta, **summary}, indent=2))
+    (run / "agent_report.md").write_text(render_markdown(summary, meta))
+    print(f"wrote agent_report.json and agent_report.md in {run}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m evaluation", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -144,6 +209,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--thresholds", default="")
     p.add_argument("--n-boot", type=int, default=200)
     p.set_defaults(fn=_cmd_report)
+
+    p = sub.add_parser("agent-scan")
+    p.add_argument("--llm", choices=["real", "scripted-gullible", "scripted-resistant"], default="real")
+    p.add_argument("--model-id", default="", help="provider id from config/models.json (real runs)")
+    p.add_argument("--systems", nargs="+", choices=["no_shield", "prompt_hardening", "shield_full", "shield_no_quarantine", "shield_no_monitor"])
+    p.add_argument("--roles", nargs="+", choices=["Domain Admins", "Data Science", "Standard Users"])
+    p.add_argument("--repeats", type=int, default=1, help="repeat each scenario (LLMs are non-deterministic)")
+    p.add_argument("--limit-scenarios", type=int, default=0)
+    p.add_argument("--embeddings", choices=["on", "off"], default="on")
+    p.add_argument("--tag", default="")
+    p.add_argument("--results-dir", default=str(Path(__file__).parent / "results"))
+    p.set_defaults(fn=_cmd_agent_scan)
+
+    p = sub.add_parser("agent-report")
+    p.add_argument("run")
+    p.set_defaults(fn=_cmd_agent_report)
 
     args = ap.parse_args(argv)
     return int(args.fn(args))

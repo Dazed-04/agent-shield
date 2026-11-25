@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import axios from "axios";
 import { AlertTriangle, RefreshCw } from "lucide-react";
+import AgentReport from "./AgentReport";
 import DetectorReport from "./DetectorReport";
 import { fmtInt } from "./format";
 
@@ -116,6 +117,7 @@ export default function EvalRuns() {
           )}
 
           {detail.kind === "detector" && <DetectorReport report={detail.report} />}
+          {detail.kind === "agent" && <AgentReport report={detail.report} />}
         </>
       )}
     </div>

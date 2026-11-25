@@ -1,5 +1,5 @@
 import ApiKeyModal from "./components/modals/ApiKeyModal";
-import { useState, useEffect, useRef } from "react";
+import { lazy, Suspense, useState, useEffect, useRef } from "react";
 import axios from "axios";
 import { ShieldAlert, ShieldCheck, AlertTriangle, Ban } from "lucide-react";
 
@@ -12,6 +12,9 @@ import InspectorDrawer from "./components/layout/InspectorDrawer";
 import ArtifactModal from "./components/modals/ArtifactModal";
 import ApprovalModal from "./components/modals/ApprovalModal";
 import AuditModal from "./components/modals/AuditModal";
+
+// Charts pull in recharts; keep them out of the main chat bundle until the dashboard is opened.
+const DashboardModal = lazy(() => import("./components/dashboard/DashboardModal"));
 
 // Same-origin by default (served by FastAPI, or proxied by Vite in dev). Override with VITE_API_BASE.
 const API_BASE = import.meta.env.VITE_API_BASE || "/api";
@@ -114,6 +117,7 @@ export default function App() {
   const [editingIndex, setEditingIndex] = useState(null);
   const [editPromptText, setEditPromptText] = useState("");
 
+  const [showDashboard, setShowDashboard] = useState(false);
   const [auditModalCategory, setAuditModalCategory] = useState(null);
   const [categoryLogs, setCategoryLogs] = useState([]);
   const [loadingCategoryLogs, setLoadingCategoryLogs] = useState(false);
@@ -547,6 +551,7 @@ export default function App() {
         onRunPreset={sendPrompt}
         analytics={analytics}
         onRefreshTelemetry={fetchData}
+        onOpenDashboard={() => setShowDashboard(true)}
         onOpenCategoryLogs={async (category) => {
           setAuditModalCategory(category);
           setLoadingCategoryLogs(true);
@@ -761,6 +766,12 @@ export default function App() {
           fetchData();
         }}
       />
+
+      <Suspense fallback={null}>
+        {showDashboard && (
+          <DashboardModal open onClose={() => setShowDashboard(false)} />
+        )}
+      </Suspense>
 
       <AuditModal
         category={auditModalCategory}

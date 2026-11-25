@@ -6,6 +6,7 @@ import {
   Pencil,
   ChevronLeft,
   RefreshCw,
+  BarChart3,
 } from "lucide-react";
 import ModernLogo from "../ui/ModernLogo";
 import Tooltip from "../ui/Tooltip";
@@ -24,6 +25,7 @@ export default function Sidebar({
   onRunPreset,
   analytics,
   onRefreshTelemetry,
+  onOpenDashboard,
   onOpenCategoryLogs,
 }) {
   return (
@@ -191,6 +193,13 @@ export default function Sidebar({
               </div>
             </Tooltip>
           </div>
+          <button
+            onClick={onOpenDashboard}
+            className="mt-2 w-full flex items-center justify-center gap-1.5 p-1.5 rounded border border-slate-700 text-[10px] text-slate-300 hover:text-sky-300 hover:border-sky-500/40 cursor-pointer transition"
+          >
+            <BarChart3 className="w-3 h-3" />
+            Open dashboard
+          </button>
         </div>
       )}
     </aside>

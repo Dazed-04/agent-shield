@@ -62,3 +62,9 @@ THREAT_VECTORS_PATH = os.getenv(
     "THREAT_VECTORS_PATH",
     os.path.abspath(os.path.join(os.path.dirname(__file__), "config/threat_vectors.json")),
 )
+
+# Where `python -m evaluation` writes run folders; the dashboard reads them from here (admin only).
+EVAL_RESULTS_DIR = os.getenv(
+    "EVAL_RESULTS_DIR",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "evaluation", "results")),
+)

@@ -22,8 +22,9 @@ from sqlalchemy.orm import Session
 from app.agent.langgraph_agent import AgentState, compiled_agent
 from app.agent.tools import TOOLS_BY_NAME
 from app.auth import Principal, authenticate, is_development, require_admin, require_user
-from app.config import CORS_ORIGINS
+from app.config import CORS_ORIGINS, EVAL_RESULTS_DIR
 from app.database import SessionLocal, get_db, init_db
+from app.eval_results import RunNotFound, RunTooLarge, list_runs, load_run
 from app.events import broadcaster
 from app.metrics import AuditRow, compute_metrics
 from app.models import SecurityAuditLog, utcnow
@@ -571,6 +572,22 @@ def get_logs_by_decision(
 @app.get("/api/analytics")
 def get_analytics(db: DbSession, principal: User) -> dict[str, Any]:
     return get_analytics_payload(db, None if principal.is_admin else principal.user)
+
+
+@app.get("/api/eval/runs")
+def eval_runs(_: Admin) -> list[dict[str, Any]]:
+    """Saved evaluation runs (newest first). Empty when nothing has been run on this host."""
+    return list_runs(EVAL_RESULTS_DIR)
+
+
+@app.get("/api/eval/runs/{run_id}")
+def eval_run(run_id: str, _: Admin) -> dict[str, Any]:
+    try:
+        return load_run(EVAL_RESULTS_DIR, run_id)
+    except RunNotFound:
+        raise HTTPException(status_code=404, detail="Run or report not found. Generate it with `python -m evaluation report|agent-report`.") from None
+    except RunTooLarge:
+        raise HTTPException(status_code=413, detail="Report file is too large to serve.") from None
 
 
 MAX_METRIC_ROWS = 50_000

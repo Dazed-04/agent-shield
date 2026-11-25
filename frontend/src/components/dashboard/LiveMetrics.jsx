@@ -61,10 +61,12 @@ export default function LiveMetrics() {
     setLoading(true);
     setError("");
     try {
-      setData((await axios.get(`${API_BASE}/analytics/metrics`, { params: { days } })).data);
+      const res = (await axios.get(`${API_BASE}/analytics/metrics`, { params: { days } })).data;
+      if (!res || !res.decision_mix || !Array.isArray(res.timeseries)) throw new Error("bad payload");
+      setData(res);
     } catch (e) {
       setData(null);
-      setError(e.response?.data?.detail || "Could not load metrics.");
+      setError(e.response?.data?.detail || "Could not load metrics (unexpected server response).");
     } finally {
       setLoading(false);
     }

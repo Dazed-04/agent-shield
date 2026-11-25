@@ -21,6 +21,7 @@ def test_percentiles_interpolate_and_handle_small_inputs():
 
 def test_empty_window_is_well_formed():
     m = compute_metrics([], 7, NOW)
+    assert m["thresholds"] == {"allow_max": 25.0, "warn_max": 55.0, "approve_max": 80.0}
     assert m["n"] == 0 and m["decision_mix"] == {"ALLOW": 0, "WARN": 0, "APPROVE": 0, "BLOCK": 0}
     assert len(m["score_histogram"]) == 10 and m["timeseries"] == [] and m["latency_ms"]["total"]["p50"] is None
 

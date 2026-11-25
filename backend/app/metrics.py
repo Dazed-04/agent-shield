@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any
 
-from app.config import ALLOW_MAX
+from app.config import ALLOW_MAX, APPROVE_MAX, WARN_MAX
 
 DECISIONS = ("ALLOW", "WARN", "APPROVE", "BLOCK")
 DETECTORS = ("prompt_scanner", "jailbreak_detector")
@@ -100,6 +100,7 @@ def compute_metrics(rows: list[AuditRow], days: int, now: datetime.datetime, tru
     n = len(rows)
     return {
         "window": {"days": days, "from": (now - datetime.timedelta(days=days)).isoformat(), "to": now.isoformat(), "bucket": "hour" if hourly else "day"},
+        "thresholds": {"allow_max": ALLOW_MAX, "warn_max": WARN_MAX, "approve_max": APPROVE_MAX},
         "n": n,
         "truncated": truncated,
         "decision_mix": {d: mix[d] for d in DECISIONS},

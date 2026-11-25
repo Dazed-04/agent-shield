@@ -117,6 +117,7 @@ Switchable via the `SECURITY_ENV` environment variable. **The default is `produc
 - **Interactive Attachment Pills:** Clicking file pills in chat bubbles opens an on-screen preview modal with copy and download capabilities.
 - **Per-Response Collapse/Expand:** Collapses verbose responses into a clean one-line summary while retaining security badge visibility.
 - **Telemetry Bar:** Header displays cumulative estimated token counters and current-session blocked threat metrics.
+- **Security Dashboard:** *Open dashboard* in the sidebar shows live metrics from the audit log (decision mix, score distribution, detector hit rates, latency percentiles) and, for admins, saved evaluation runs with confidence intervals. See `backend/evaluation/README.md`.
 
 ### 5. Shell-Enabled Headless CLI Client (`cli.py`)
 
@@ -310,6 +311,9 @@ python cli.py --key "$AGENT_SHIELD_KEY"      # or set AGENT_SHIELD_KEY / AGENT_S
 | `GET`  | `/api/sessions/{id}/messages` | User  | Message history for a session the caller owns.                        |
 | `GET`  | `/api/logs`                   | User  | Audit logs (`decision`, `limit`, `offset`); non-admins see their own. |
 | `GET`  | `/api/analytics`              | User  | Aggregates: counts, avg risk, avg latency, 14-day timeline.           |
+| `GET`  | `/api/analytics/metrics`      | User  | Windowed metrics: decision mix, score histogram, detector hit rates, latency percentiles per stage (`?days=1-90`). |
+| `GET`  | `/api/eval/runs`              | Admin | Saved evaluation runs (see `backend/evaluation/README.md`).           |
+| `GET`  | `/api/eval/runs/{id}`         | Admin | One run's report.                                                     |
 | `POST` | `/api/config/reload`          | Admin | Hot-reload `.env`, `policies.json` and key pools.                     |
 | `POST` | `/api/threats/learn`          | Admin | Add a validated attack phrase to the semantic detector (persisted).   |
 | `GET`  | `/api/threats`                | Admin | List learned phrases and detector mode.                               |

@@ -36,3 +36,21 @@ def test_agent_scan_dry_run_and_report(tmp_path, capsys):
     md = (run / "agent_report.md").read_text()
     assert "SYNTHETIC RUN" in md and "no_shield" in md and "shield_full" in md
     assert set(json.loads((run / "agent_report.json").read_text())) == {"meta", "systems", "breakdown"}
+
+
+def test_run_argument_accepts_path_bare_id_and_latest(tmp_path, monkeypatch):
+    import pytest
+
+    import evaluation.__main__ as cli
+
+    monkeypatch.setattr(cli, "RESULTS_DIR", tmp_path)
+    old, new = tmp_path / "20261101T000000-a", tmp_path / "20261125T000000-b"
+    old.mkdir()
+    new.mkdir()
+    assert cli._resolve_run(str(old)) == old  # full path
+    assert cli._resolve_run("20261125T000000-b") == new  # bare id
+    assert cli._resolve_run("latest") == new  # newest by name
+    with pytest.raises(SystemExit, match="replace the <run> placeholder"):
+        cli._resolve_run("<run>")
+    with pytest.raises(SystemExit, match="(?s)no run folder 'nope'.*20261125T000000-b"):
+        cli._resolve_run("nope")

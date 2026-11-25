@@ -5,6 +5,8 @@ gateway runs (`app.shield.screen_inbound`, the LangGraph agent, the tool monitor
 is what ships.
 
 Run all commands from `backend/` inside the virtualenv, with `python -m evaluation <command>`.
+Wherever a command takes a run, give the run id printed by `scan` (for example `20261125T092413-semantic`), a full
+folder path, or `latest`. Runs are stored in `backend/evaluation/results/`.
 
 ## Quick start
 
@@ -12,11 +14,11 @@ Run all commands from `backend/` inside the virtualenv, with `python -m evaluati
 python -m evaluation prepare                      # clone the public datasets at pinned commits
 python -m evaluation build                        # -> data/processed/eval_set.jsonl
 python -m evaluation scan --embeddings on         # score every sample with the production detectors
-python -m evaluation calibrate results/<run>      # fit thresholds on the DEV split only
-python -m evaluation report results/<run>         # report.json / report.md / report.csv / ablation.tex
+python -m evaluation calibrate latest             # fit thresholds on the DEV split only
+python -m evaluation report latest                # report.json / report.md / report.csv / ablation.tex
 
 python -m evaluation agent-scan --llm real --repeats 3   # end-to-end: needs a provider key in .env
-python -m evaluation agent-report results/<run>
+python -m evaluation agent-report latest
 ```
 
 `results/` and `data/` are git-ignored. The admin dashboard (sidebar → *Open dashboard* → *Evaluation

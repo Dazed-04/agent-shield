@@ -21,6 +21,24 @@ from pathlib import Path
 from .datasets import DATA_ROOT, DATASETS, RAW_ROOT, prepare
 
 
+RESULTS_DIR = Path(__file__).parent / "results"
+
+
+def _resolve_run(arg: str) -> Path:
+    """Accept a run folder path, a bare run id from the results folder, or 'latest'."""
+    direct = Path(arg)
+    if direct.is_dir():
+        return direct
+    runs = sorted((d for d in RESULTS_DIR.iterdir() if d.is_dir()), key=lambda d: d.name) if RESULTS_DIR.is_dir() else []
+    if arg == "latest" and runs:
+        return runs[-1]
+    if (RESULTS_DIR / arg).is_dir():
+        return RESULTS_DIR / arg
+    hint = "replace the <run> placeholder with a real run" if arg.startswith("<") else f"no run folder '{arg}'"
+    listing = "\n  ".join(d.name for d in runs[-5:]) or "(none yet; run `python -m evaluation scan` first)"
+    raise SystemExit(f"error: {hint}. Looked in {RESULTS_DIR}. Most recent runs:\n  {listing}")
+
+
 def _cmd_prepare(a: argparse.Namespace) -> int:
     for name in a.names or DATASETS:
         print(f"{name}: {prepare(DATASETS[name], Path(a.raw_dir))}")
@@ -78,9 +96,9 @@ def _cmd_calibrate(a: argparse.Namespace) -> int:
     from .calibrate import calibrate
     from .runner import read_predictions
 
-    rows = [r for r in read_predictions(Path(a.run) / "predictions.jsonl") if r["split"] == "dev"]
+    rows = [r for r in read_predictions(_resolve_run(a.run) / "predictions.jsonl") if r["split"] == "dev"]
     result = {s: calibrate(rows, s, a.objective, a.fpr_cap) for s in a.systems}
-    path = Path(a.run) / "thresholds.json"
+    path = _resolve_run(a.run) / "thresholds.json"
     path.write_text(json.dumps(result, indent=2))
     for s, c in result.items():
         print(f"{s}: threshold {c['threshold']} (dev macro TPR {c['dev_macro_tpr']:.3f}, FPR {c['dev_macro_fpr']:.3f})")
@@ -93,7 +111,7 @@ def _cmd_report(a: argparse.Namespace) -> int:
     from .runner import read_predictions
     from .tables import render_csv, render_latex_ablation, render_markdown
 
-    run = Path(a.run)
+    run = _resolve_run(a.run)
     meta = json.loads((run / "run.json").read_text())
     cal = None
     tpath = Path(a.thresholds) if a.thresholds else run / "thresholds.json"
@@ -161,7 +179,7 @@ def _cmd_agent_report(a: argparse.Namespace) -> int:
     from .agent_report import render_markdown, summarize
     from .runner import read_predictions
 
-    run = Path(a.run)
+    run = _resolve_run(a.run)
     rows = read_predictions(run / "agent_runs.jsonl")
     meta = json.loads((run / "agent_run.json").read_text())
     summary = summarize(rows)
@@ -194,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--use-learned", action="store_true", help="include runtime-learned anchors (off by default: they contaminate benchmarks)")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--tag", default="")
-    p.add_argument("--results-dir", default=str(Path(__file__).parent / "results"))
+    p.add_argument("--results-dir", default=str(RESULTS_DIR))
     p.set_defaults(fn=_cmd_scan)
 
     p = sub.add_parser("calibrate")
@@ -219,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit-scenarios", type=int, default=0)
     p.add_argument("--embeddings", choices=["on", "off"], default="on")
     p.add_argument("--tag", default="")
-    p.add_argument("--results-dir", default=str(Path(__file__).parent / "results"))
+    p.add_argument("--results-dir", default=str(RESULTS_DIR))
     p.set_defaults(fn=_cmd_agent_scan)
 
     p = sub.add_parser("agent-report")

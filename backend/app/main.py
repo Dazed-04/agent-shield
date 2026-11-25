@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -24,7 +25,8 @@ from app.auth import Principal, authenticate, is_development, require_admin, req
 from app.config import CORS_ORIGINS
 from app.database import SessionLocal, get_db, init_db
 from app.events import broadcaster
-from app.models import SecurityAuditLog
+from app.metrics import AuditRow, compute_metrics
+from app.models import SecurityAuditLog, utcnow
 from app.schemas import (
     AddThreatRequest,
     ChatRequest,
@@ -569,6 +571,39 @@ def get_logs_by_decision(
 @app.get("/api/analytics")
 def get_analytics(db: DbSession, principal: User) -> dict[str, Any]:
     return get_analytics_payload(db, None if principal.is_admin else principal.user)
+
+
+MAX_METRIC_ROWS = 50_000
+
+
+@app.get("/api/analytics/metrics")
+def get_metrics(db: DbSession, principal: User, days: int = 7) -> dict[str, Any]:
+    """Decision mix, score distribution, detector hit rates, latency percentiles and a time series."""
+    days = max(1, min(days, 90))
+    now = utcnow()
+    q = db.query(SecurityAuditLog).filter(SecurityAuditLog.timestamp >= now - datetime.timedelta(days=days))
+    if not principal.is_admin:
+        q = q.filter(SecurityAuditLog.user_id == principal.user)
+    found = (
+        q.with_entities(
+            SecurityAuditLog.timestamp,
+            SecurityAuditLog.role,
+            SecurityAuditLog.decision,
+            SecurityAuditLog.risk_score,
+            SecurityAuditLog.latency_ms,
+            SecurityAuditLog.triggered_detectors,
+            SecurityAuditLog.tool_calls_attempted,
+        )
+        .order_by(SecurityAuditLog.id.desc())
+        .limit(MAX_METRIC_ROWS + 1)
+        .all()
+    )
+    truncated = len(found) > MAX_METRIC_ROWS
+    rows = [
+        AuditRow(ts, role, str(dec), float(score or 0.0), lat, det if isinstance(det, dict) else {}, len(calls) if isinstance(calls, list) else 0)
+        for ts, role, dec, score, lat, det, calls in found[:MAX_METRIC_ROWS]
+    ]
+    return compute_metrics(rows, days, now, truncated)
 
 
 @app.get("/api/sessions")

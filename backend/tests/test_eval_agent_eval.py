@@ -93,3 +93,80 @@ def test_matrix_covers_each_system_and_only_shielded_systems_use_roles():
         for r in run_matrix(SCEN[:2], SYSTEMS, ROLES):
             agg[r["system"]].add(r["role"])
     assert agg["no_shield"] == {"n/a"} and agg["shield_full"] == set(ROLES)
+
+
+# ---- provider failures ------------------------------------------------------------------------------------------------
+
+from evaluation.agent_eval import QuotaExhausted, RunAborted, classify_provider_error, retry_delay  # noqa: E402
+
+
+class _Boom(Exception):
+    pass
+
+
+def _rate_limit(msg):
+    e = type("RateLimitError", (Exception,), {})
+    return e(f"Error code: 429 - {msg}")
+
+
+def test_provider_errors_are_classified():
+    assert classify_provider_error(_rate_limit("Rate limit reached ... on tokens per day (TPD): Limit 200000")) == "daily_quota"
+    assert classify_provider_error(_rate_limit("Rate limit reached ... on tokens per minute (TPM). Please try again in 7.5s")) == "rate_limit"
+    assert classify_provider_error(_Boom("connection reset")) is None
+
+
+def test_retry_delay_follows_the_hint_and_is_capped():
+    assert retry_delay(_rate_limit("Please try again in 7.5s"), 0) == 8.5
+    assert retry_delay(_rate_limit("Please try again in 1m3.2s"), 0) == 64.2
+    assert retry_delay(_rate_limit("no hint"), 2) == 20.0
+    assert retry_delay(_rate_limit("Please try again in 30m0s"), 0) == 90.0
+
+
+class _FlakyLLM:
+    """Fails with a per-minute rate limit `fails` times, then behaves like the resistant scripted model."""
+
+    def __init__(self, fails, exc):
+        self.fails, self.exc, self.inner = fails, exc, ScriptedAgentLLM("resistant")
+
+    def invoke(self, msgs, *a, **k):
+        if self.fails > 0:
+            self.fails -= 1
+            raise self.exc
+        return self.inner.invoke(msgs, *a, **k)
+
+
+def _run(system, llm_factory, **kw):
+    with mock.patch.object(g, "get_llm_with_fallbacks", lambda tools, mid=None: llm_factory()):
+        return run_one(system, "n/a", SCEN[0], **kw)
+
+
+def test_per_minute_rate_limit_is_retried_with_backoff():
+    sleeps = []
+    flaky = _FlakyLLM(2, _rate_limit("try again in 2s"))
+    rec = _run("no_shield", lambda: flaky, sleep=sleeps.append)
+    assert rec["status"] == "COMPLETED" and rec["retries"] == 2 and sleeps == [3.0, 3.0]
+
+
+def test_exhausted_retries_record_an_error_instead_of_looping():
+    rec = _run("no_shield", lambda: _FlakyLLM(99, _rate_limit("try again in 1s")), max_retries=2, sleep=lambda s: None)
+    assert rec["status"] == "ERROR" and rec["retries"] == 2
+
+
+def test_daily_quota_stops_the_run_at_once():
+    with pytest.raises(QuotaExhausted):
+        _run("no_shield", lambda: _FlakyLLM(99, _rate_limit("on tokens per day (TPD): Limit 200000")), sleep=lambda s: pytest.fail("must not wait"))
+
+
+def test_matrix_aborts_after_consecutive_errors_but_keeps_what_it_has():
+    got = []
+    with mock.patch.object(g, "get_llm_with_fallbacks", lambda tools, mid=None: _FlakyLLM(99, _Boom("down"))):
+        with pytest.raises(RunAborted):
+            for r in run_matrix(SCEN, ("no_shield",), max_consecutive_errors=3):
+                got.append(r)
+    assert len(got) == 3 and all(r["status"] == "ERROR" for r in got)
+
+
+def test_matrix_skip_hook_leaves_out_finished_work():
+    with mock.patch.object(g, "get_llm_with_fallbacks", lambda tools, mid=None: ScriptedAgentLLM("resistant")):
+        rows = list(run_matrix(SCEN[:4], ("no_shield",), skip=lambda sy, ro, sid, k: sid == SCEN[0].id))
+    assert len(rows) == 3 and SCEN[0].id not in {r["id"] for r in rows}

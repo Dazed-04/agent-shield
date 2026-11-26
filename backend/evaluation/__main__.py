@@ -145,7 +145,7 @@ def _cmd_agent_scan(a: argparse.Namespace) -> int:
     import app.agent.langgraph_agent as graph
 
     from .agent_bench import build_scenarios
-    from .agent_eval import DEFAULT_ROLES, SHIELDED, SYSTEMS, run_matrix
+    from .agent_eval import DEFAULT_ROLES, SHIELDED, SYSTEMS, QuotaExhausted, RunAborted, run_matrix
     from .runner import run_metadata
     from .scripted_llm import ScriptedAgentLLM
 
@@ -159,19 +159,41 @@ def _cmd_agent_scan(a: argparse.Namespace) -> int:
           f"each run makes ~2-4 model calls" + (" (REAL model: check your provider quota)" if a.llm == "real" else " (scripted: free)"))
     patch = (mock.patch.object(graph, "get_llm_with_fallbacks", lambda tools, mid=None: ScriptedAgentLLM(a.llm.split("-", 1)[1]))
              if a.llm.startswith("scripted") else mock.patch.object(graph, "__name__", graph.__name__))
-    rid = f"{dt.datetime.now(dt.UTC):%Y%m%dT%H%M%S}-agent-{a.llm}" + (f"-{a.tag}" if a.tag else "")
-    out = Path(a.results_dir) / rid
-    out.mkdir(parents=True, exist_ok=False)
-    with patch, (out / "agent_runs.jsonl").open("w", encoding="utf-8") as f:
-        for rec in run_matrix(scenarios, systems, roles, a.model_id or None, a.repeats, progress=lambda i, n: print(f"  {i}/{n}", flush=True)):
-            f.write(json.dumps(rec) + "\n")
-            f.flush()
+    done: set[tuple[str, str, str, int]] = set()
+    if a.resume:
+        out = _resolve_run(a.resume)
+        rid = out.name
+        prior = out / "agent_runs.jsonl"
+        if prior.exists():  # only runs that produced a verdict count as done; errored ones are retried
+            from .runner import read_predictions
+
+            done = {(r["system"], r["role"], r["id"], r["repeat"]) for r in read_predictions(prior) if r["status"] != "ERROR"}
+        print(f"resuming {rid}: {len(done)} runs already complete")
+    else:
+        rid = f"{dt.datetime.now(dt.UTC):%Y%m%dT%H%M%S}-agent-{a.llm}" + (f"-{a.tag}" if a.tag else "")
+        out = Path(a.results_dir) / rid
+        out.mkdir(parents=True, exist_ok=False)
+    stopped = ""
+    with patch, (out / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+        try:
+            for rec in run_matrix(scenarios, systems, roles, a.model_id or None, a.repeats, progress=lambda i, n: print(f"  {i}/{n}", flush=True),
+                                  max_consecutive_errors=a.max_consecutive_errors, skip=lambda sy, ro, sid, k: (sy, ro, sid, k) in done):
+                f.write(json.dumps(rec) + "\n")
+                f.flush()
+        except QuotaExhausted as e:
+            stopped = f"provider daily quota exhausted: {e}"
+        except RunAborted as e:
+            stopped = str(e)
     meta = run_metadata(0, [])
     meta.update({"run_id": rid, "llm": a.llm, "model_id": a.model_id or None, "repeats": a.repeats, "n_scenarios": len(scenarios),
-                 "systems": systems, "roles": roles})
+                 "systems": systems, "roles": roles, "complete": not stopped, "stopped_reason": stopped or None})
     meta.pop("datasets", None)
     (out / "agent_run.json").write_text(json.dumps(meta, indent=2))
     print(f"run {out}")
+    if stopped:
+        print(f"STOPPED EARLY: {stopped}\nResults so far are saved. Resume later with:\n  python -m evaluation agent-scan --resume {rid} "
+              f"--llm {a.llm} --repeats {a.repeats}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -235,6 +257,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--roles", nargs="+", choices=["Domain Admins", "Data Science", "Standard Users"])
     p.add_argument("--repeats", type=int, default=1, help="repeat each scenario (LLMs are non-deterministic)")
     p.add_argument("--limit-scenarios", type=int, default=0)
+    p.add_argument("--resume", default="", help="continue an interrupted run (folder, run id or 'latest'): finished runs are kept, errored ones retried")
+    p.add_argument("--max-consecutive-errors", type=int, default=8, help="stop (and save) after this many provider errors in a row")
     p.add_argument("--embeddings", choices=["on", "off"], default="on")
     p.add_argument("--tag", default="")
     p.add_argument("--results-dir", default=str(RESULTS_DIR))

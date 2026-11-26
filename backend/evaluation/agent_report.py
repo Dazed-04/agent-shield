@@ -27,7 +27,17 @@ def _block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def latest_per_run(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A resumed run appends: keep only the most recent record for each (system, role, scenario, repeat)."""
+    last: dict[Any, dict[str, Any]] = {}
+    for n, r in enumerate(rows):
+        key = (r["system"], r["role"], r["id"], r.get("repeat", 0)) if "id" in r else n  # rows without an id cannot be matched
+        last[key] = r
+    return list(last.values())
+
+
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = latest_per_run(rows)
     cfg: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         cfg[(r["system"], r["role"])].append(r)

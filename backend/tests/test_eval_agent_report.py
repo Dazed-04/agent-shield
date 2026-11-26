@@ -45,3 +45,14 @@ def test_markdown_flags_synthetic_runs_and_dirty_trees():
     assert "SYNTHETIC RUN" in md and "(**dirty**)" in md and "## Main table" in md and "ASR (executed) by goal" in md
     real = render_markdown(summarize([row()]), {"run_id": "r2", "llm": "real", "model_id": "m", "repeats": 3, "n_scenarios": 1})
     assert "SYNTHETIC" not in real and "`m`" in real
+
+
+def test_a_resumed_run_counts_only_the_latest_record_per_scenario():
+    from evaluation.agent_report import latest_per_run
+
+    base = {"system": "no_shield", "role": "n/a", "id": "a", "repeat": 0, "attack": True, "style": "polite", "goal": "exfil",
+            "utility": False, "attempted": False, "executed": False, "latency_ms": 1.0}
+    rows = [{**base, "status": "ERROR"}, {**base, "id": "b", "status": "COMPLETED"}, {**base, "status": "COMPLETED", "executed": True}]
+    out = latest_per_run(rows)
+    assert len(out) == 2 and {r["id"]: r["status"] for r in out} == {"a": "COMPLETED", "b": "COMPLETED"}
+    assert summarize(rows)["systems"]["no_shield|n/a"]["errors"] == 0

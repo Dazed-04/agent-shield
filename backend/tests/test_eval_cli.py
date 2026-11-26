@@ -54,3 +54,38 @@ def test_run_argument_accepts_path_bare_id_and_latest(tmp_path, monkeypatch):
         cli._resolve_run("<run>")
     with pytest.raises(SystemExit, match="(?s)no run folder 'nope'.*20261125T000000-b"):
         cli._resolve_run("nope")
+
+
+def _scan(res, *extra):
+    return main(["agent-scan", "--llm", "scripted-gullible", "--embeddings", "off", "--limit-scenarios", "3", "--systems", "no_shield",
+                 "--results-dir", str(res), *extra])
+
+
+def test_agent_scan_stops_early_saves_progress_and_resumes(tmp_path, monkeypatch, capsys):
+    import evaluation.agent_eval as ae
+
+    real = ae.run_one
+    calls = []
+
+    def flaky(system, role, s, model_id=None, repeat=0, **kw):
+        calls.append(s.id)
+        if len(calls) > 1:  # first run succeeds, every later one fails like an exhausted provider
+            return {"id": s.id, "attack": s.attack, "style": s.style, "goal": s.goal, "utility": False, "status": "ERROR", "error": "down",
+                    "attempted": False, "executed": False, "system": system, "role": "n/a", "repeat": repeat, "notes": [], "latency_ms": 1.0}
+        return real(system, role, s, model_id, repeat, **kw)
+
+    monkeypatch.setattr(ae, "run_one", flaky)
+    res = tmp_path / "res"
+    assert _scan(res, "--max-consecutive-errors", "2") == 2
+    err = capsys.readouterr().err
+    (run,) = res.iterdir()
+    assert "--resume" in err and run.name in err
+    meta = json.loads((run / "agent_run.json").read_text())
+    assert meta["complete"] is False and "consecutive" in meta["stopped_reason"]
+    assert len((run / "agent_runs.jsonl").read_text().splitlines()) == 3  # 1 good + 2 errors kept on disk
+
+    monkeypatch.setattr(ae, "run_one", real)  # provider recovered
+    assert _scan(res, "--resume", str(run)) == 0
+    rows = [json.loads(x) for x in (run / "agent_runs.jsonl").read_text().splitlines()]
+    assert sum(r["status"] != "ERROR" for r in rows) == 3  # the finished run was not repeated, the two errored ones were redone
+    assert json.loads((run / "agent_run.json").read_text())["complete"] is True

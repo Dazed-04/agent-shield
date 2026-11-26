@@ -61,11 +61,13 @@ function Matrix({ report, dim, title }) {
 export default function AgentReport({ report }) {
   const meta = report.meta || {};
   const entries = Object.entries(report.systems);
+  const unreliable = (b) => b.reliable === false; // reports written before this flag existed are treated as reliable
   const chart = entries.map(([k, b]) => ({
     name: label(k),
-    attempted: pct(b.asr_attempted),
-    executed: pct(b.asr_executed),
+    attempted: unreliable(b) ? null : pct(b.asr_attempted),
+    executed: unreliable(b) ? null : pct(b.asr_executed),
   }));
+  const incomplete = meta.complete === false || entries.some(([, b]) => unreliable(b));
   const synthetic = String(meta.llm || "").startsWith("scripted");
 
   return (
@@ -75,6 +77,15 @@ export default function AgentReport({ report }) {
           <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
           Synthetic run ({meta.llm}): a scripted stand-in for the model, not a real LLM. It validates the harness only;
           do not report these numbers as results.
+        </div>
+      )}
+
+      {incomplete && (
+        <div className="flex gap-2 p-2.5 text-[11px] text-rose-300 bg-rose-950/20 border border-rose-900/40 rounded-lg">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+          Incomplete run: do not quote these numbers.
+          {meta.complete === false && meta.stopped_reason ? ` It stopped early (${meta.stopped_reason}).` : ""} Systems with many
+          provider errors are marked INCOMPLETE below. Continue with <code>agent-scan --resume {meta.run_id}</code>.
         </div>
       )}
 
@@ -96,7 +107,14 @@ export default function AgentReport({ report }) {
             </tr>
           </thead>
           <tbody className="text-slate-300">
-            {entries.map(([k, b]) => (
+            {entries.map(([k, b]) => unreliable(b) ? (
+              <tr key={k}>
+                <td className={`${td} font-sans`}>{label(k)}</td>
+                <td className={td}>{fmtInt(b.attacks)}</td>
+                <td className={`${td} text-rose-300 font-semibold`} colSpan={5}>INCOMPLETE</td>
+                <td className={td}>{fmtInt(b.errors)} of {fmtInt(b.runs)}</td>
+              </tr>
+            ) : (
               <tr key={k}>
                 <td className={`${td} font-sans`}>{label(k)}</td>
                 <td className={td}>{fmtInt(b.attacks)}</td>

@@ -56,3 +56,20 @@ def test_a_resumed_run_counts_only_the_latest_record_per_scenario():
     out = latest_per_run(rows)
     assert len(out) == 2 and {r["id"]: r["status"] for r in out} == {"a": "COMPLETED", "b": "COMPLETED"}
     assert summarize(rows)["systems"]["no_shield|n/a"]["errors"] == 0
+
+
+def test_systems_dominated_by_provider_errors_are_not_reported_as_results():
+    rows = [row(system="no_shield", executed=True) for _ in range(20)] + [row(status="ERROR") for _ in range(20)]
+    s = summarize(rows)["systems"]
+    assert s["no_shield|Domain Admins"]["reliable"] is True
+    assert s["shield_full|Domain Admins"]["reliable"] is False and s["shield_full|Domain Admins"]["error_rate"] == 1.0
+    md = render_markdown(summarize(rows), {"run_id": "r", "llm": "real", "repeats": 1, "n_scenarios": 1})
+    assert "INCOMPLETE RUN: do not quote" in md and "| shield_full | Domain Admins | 0 | INCOMPLETE |" in md
+    full = next(line for line in md.splitlines() if line.startswith("| no_shield"))
+    assert "INCOMPLETE" not in full and "100.0%" in full
+
+
+def test_an_early_stopped_run_is_flagged_even_when_every_system_looks_fine():
+    md = render_markdown(summarize([row()]), {"run_id": "r9", "llm": "real", "repeats": 1, "n_scenarios": 1, "complete": False,
+                                              "stopped_reason": "quota"})
+    assert "INCOMPLETE RUN" in md and "agent-scan --resume r9" in md
